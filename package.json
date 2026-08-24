@@ -1,0 +1,12 @@
+{
+  "name": "mediindex",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Offline-first medicine inventory and expiry management system",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "engines": { "node": ">=22" }
+}
