@@ -2,13 +2,12 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { DatabaseSync } = require('node:sqlite');
+const { createDatabaseAdapter } = require('./db/index');
 
 const PORT = Number(process.env.PORT || 3000);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DB_PATH = path.join(DATA_DIR, 'mediindex.db');
 const SESSION_TTL_MS = 6 * 60 * 60 * 1000;
-const sessions = new Map();
 
 function passwordHash(password, salt = crypto.randomBytes(16).toString('hex')) {
   const hash = crypto.scryptSync(password, salt, 64).toString('hex');
@@ -21,83 +20,14 @@ function passwordMatches(password, stored) {
   return crypto.timingSafeEqual(Buffer.from(actualHash, 'hex'), Buffer.from(storedHash, 'hex'));
 }
 
-function initializeDatabase() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const db = new DatabaseSync(DB_PATH);
-  db.exec(`
-    PRAGMA foreign_keys = ON;
-    PRAGMA journal_mode = WAL;
-    PRAGMA busy_timeout = 5000;
-    CREATE TABLE IF NOT EXISTS pharmacies (
-      id INTEGER PRIMARY KEY, name TEXT NOT NULL, address TEXT,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY, pharmacy_id INTEGER NOT NULL REFERENCES pharmacies(id),
-      full_name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
-      role TEXT NOT NULL CHECK(role IN ('ADMIN', 'STAFF')), active INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_login_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS medicines (
-      id INTEGER PRIMARY KEY, pharmacy_id INTEGER NOT NULL REFERENCES pharmacies(id),
-      name TEXT NOT NULL, generic_name TEXT, manufacturer TEXT, category TEXT,
-      minimum_stock INTEGER NOT NULL DEFAULT 0 CHECK(minimum_stock >= 0), active INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE INDEX IF NOT EXISTS idx_medicines_name ON medicines(name);
-    CREATE TABLE IF NOT EXISTS medicine_batches (
-      id INTEGER PRIMARY KEY, medicine_id INTEGER NOT NULL REFERENCES medicines(id),
-      batch_number TEXT NOT NULL, quantity INTEGER NOT NULL CHECK(quantity >= 0),
-      purchase_price REAL NOT NULL DEFAULT 0 CHECK(purchase_price >= 0),
-      selling_price REAL NOT NULL CHECK(selling_price >= 0),
-      manufacturing_date TEXT, expiry_date TEXT NOT NULL, location TEXT,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(medicine_id, batch_number)
-    );
-    CREATE INDEX IF NOT EXISTS idx_batches_expiry ON medicine_batches(expiry_date);
-    CREATE TABLE IF NOT EXISTS inventory_movements (
-      id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL REFERENCES medicine_batches(id),
-      change_quantity INTEGER NOT NULL CHECK(change_quantity != 0),
-      reason TEXT NOT NULL CHECK(reason IN ('RECEIPT', 'ADJUSTMENT', 'SALE')),
-      created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE INDEX IF NOT EXISTS idx_movements_batch ON inventory_movements(batch_id);
-    CREATE TABLE IF NOT EXISTS sales (
-      id INTEGER PRIMARY KEY, pharmacy_id INTEGER NOT NULL REFERENCES pharmacies(id),
-      invoice_number TEXT NOT NULL UNIQUE, customer_name TEXT, customer_phone TEXT,
-      payment_method TEXT NOT NULL DEFAULT 'CASH', total_amount REAL NOT NULL CHECK(total_amount >= 0),
-      created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS sale_items (
-      id INTEGER PRIMARY KEY, sale_id INTEGER NOT NULL REFERENCES sales(id),
-      batch_id INTEGER NOT NULL REFERENCES medicine_batches(id), quantity INTEGER NOT NULL CHECK(quantity > 0),
-      unit_price REAL NOT NULL CHECK(unit_price >= 0), line_total REAL NOT NULL CHECK(line_total >= 0)
-    );
-    CREATE TABLE IF NOT EXISTS expiry_alerts (
-      id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL REFERENCES medicine_batches(id),
-      alert_type TEXT NOT NULL CHECK(alert_type IN ('EXPIRED', 'EXPIRING_SOON', 'LOW_STOCK')),
-      acknowledged INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_expiry_alert_once ON expiry_alerts(batch_id, alert_type);
-  `);
-  try {
-    const cols = db.prepare('PRAGMA table_info(sales)').all().map(c => c.name);
-    if (!cols.includes('customer_name')) db.exec('ALTER TABLE sales ADD COLUMN customer_name TEXT');
-    if (!cols.includes('customer_phone')) db.exec('ALTER TABLE sales ADD COLUMN customer_phone TEXT');
-    if (!cols.includes('payment_method')) db.exec("ALTER TABLE sales ADD COLUMN payment_method TEXT NOT NULL DEFAULT 'CASH'");
-  } catch {}
-  const hasPharmacy = db.prepare('SELECT id FROM pharmacies LIMIT 1').get();
-  if (!hasPharmacy) {
-    db.prepare('INSERT INTO pharmacies (name, address) VALUES (?, ?)').run('MediIndex Demo Pharmacy', 'Chhatrapati Sambhajinagar');
-    const pharmacy = db.prepare('SELECT id FROM pharmacies LIMIT 1').get();
-    const addUser = db.prepare('INSERT INTO users (pharmacy_id, full_name, email, password_hash, role) VALUES (?, ?, ?, ?, ?)');
-    addUser.run(pharmacy.id, 'Demo Administrator', 'admin@mediindex.local', passwordHash('MediIndex@2026'), 'ADMIN');
-    addUser.run(pharmacy.id, 'Demo Pharmacy Staff', 'staff@mediindex.local', passwordHash('MediIndex@2026'), 'STAFF');
-  }
-  return db;
+function hashSessionToken(token) {
+  if (typeof token !== 'string' || !token.trim()) return '';
+  return crypto.createHash('sha256').update(token.trim()).digest('hex');
 }
 
-const db = initializeDatabase();
+// Auto-select adapter: PostgreSQL if DATABASE_URL set, otherwise SQLite
+const adapter = createDatabaseAdapter({ dataDir: DATA_DIR, dbPath: DB_PATH }).initialize();
+const db = adapter.db;
 
 function json(res, status, body, extraHeaders = {}) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...extraHeaders });
@@ -113,12 +43,82 @@ function parseCookies(req) {
 
 function currentUser(req) {
   const token = parseCookies(req).mediindex_session;
-  const session = token && sessions.get(token);
-  if (!session || session.expiresAt < Date.now()) {
-    if (token) sessions.delete(token);
+  if (!token) return null;
+  const tokenHash = hashSessionToken(token);
+  if (!tokenHash) return null;
+
+  const row = db.prepare(`
+    SELECT s.token_hash, s.user_id, s.pharmacy_id, s.expires_at,
+           u.id, u.full_name, u.email, u.role, u.active
+    FROM sessions s
+    JOIN users u ON u.id = s.user_id
+    WHERE s.token_hash = ? AND u.active = 1
+  `).get(tokenHash);
+
+  if (!row) return null;
+
+  if (new Date(row.expires_at).getTime() < Date.now()) {
+    try {
+      db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+    } catch {}
     return null;
   }
-  return db.prepare('SELECT id, pharmacy_id, full_name, email, role FROM users WHERE id = ? AND active = 1').get(session.userId) || null;
+
+  return {
+    id: row.id,
+    pharmacy_id: row.pharmacy_id,
+    full_name: row.full_name,
+    email: row.email,
+    role: row.role
+  };
+}
+
+function hashDeviceToken(token) {
+  if (typeof token !== 'string') return '';
+  return crypto.createHash('sha256').update(token.trim()).digest('hex');
+}
+
+function parseDeviceToken(req) {
+  const headerToken = req.headers['x-device-token'];
+  if (headerToken && typeof headerToken === 'string' && headerToken.trim()) {
+    return headerToken.trim();
+  }
+  const authHeader = req.headers['authorization'];
+  if (authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+    return authHeader.slice(7).trim();
+  }
+  return null;
+}
+
+function currentDevice(req) {
+  const rawToken = parseDeviceToken(req);
+  if (!rawToken) return null;
+  const tokenHash = hashDeviceToken(rawToken);
+  const row = db.prepare(`
+    SELECT d.id, d.pharmacy_id, d.device_name, d.device_model, d.token_hash, d.paired_by, d.created_at, d.last_seen_at, d.revoked, d.revoked_at,
+           p.name AS pharmacy_name, p.address AS pharmacy_address
+    FROM paired_devices d
+    JOIN pharmacies p ON p.id = d.pharmacy_id
+    WHERE d.token_hash = ? AND d.revoked = 0
+  `).get(tokenHash);
+
+  if (!row) return null;
+
+  try {
+    db.prepare('UPDATE paired_devices SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?').run(row.id);
+  } catch {}
+
+  return {
+    id: row.id,
+    pharmacyId: row.pharmacy_id,
+    pharmacyName: row.pharmacy_name,
+    pharmacyAddress: row.pharmacy_address,
+    deviceName: row.device_name,
+    deviceModel: row.device_model,
+    pairedBy: row.paired_by,
+    createdAt: row.created_at,
+    lastSeenAt: row.last_seen_at
+  };
 }
 
 function readJson(req) {
@@ -321,6 +321,39 @@ function serializeMedicine(row) {
   return { ...row, total_stock: db.prepare('SELECT COALESCE(SUM(quantity), 0) AS value FROM medicine_batches WHERE medicine_id = ?').get(row.id).value };
 }
 
+function parseAndValidateQrPayload(raw) {
+  let payload = raw;
+  if (typeof payload === 'string') {
+    try {
+      payload = JSON.parse(payload.trim());
+    } catch {
+      // Check if pipe-delimited format: MEDIINDEX|v1|MED_ID|BATCH_NO
+      const parts = payload.trim().split('|');
+      if (parts.length >= 4 && parts[0] === 'MEDIINDEX') {
+        payload = {
+          app: parts[0],
+          v: Number(parts[1].replace(/^v/i, '')) || 1,
+          medicineId: Number(parts[2]),
+          batchNumber: parts[3]
+        };
+      } else {
+        throw new Error('QR payload is not recognized as a valid MediIndex code.');
+      }
+    }
+  }
+
+  if (!payload || typeof payload !== 'object') throw new Error('Invalid QR payload structure.');
+  if (payload.app !== 'MEDIINDEX') throw new Error('Unrecognized application tag. Expected MEDIINDEX.');
+  if (Number(payload.v) !== 1) throw new Error(`Unsupported QR version: ${payload.v}. Expected version 1.`);
+
+  const medicineId = Number(payload.medicineId);
+  if (!Number.isInteger(medicineId) || medicineId <= 0) throw new Error('Invalid medicine ID in QR payload.');
+
+  const batchNumber = cleanText(payload.batchNumber, 'Batch number', { required: true, max: 80 });
+
+  return { medicineId, batchNumber };
+}
+
 function serveFile(res, requestedPath) {
   const filePath = requestedPath === '/' ? path.join(__dirname, 'public', 'index.html') : path.join(__dirname, 'public', requestedPath);
   const normalized = path.normalize(filePath);
@@ -340,14 +373,28 @@ async function handler(req, res) {
       if (typeof email !== 'string' || typeof password !== 'string') return json(res, 400, { error: 'Email and password are required.' });
       const user = db.prepare('SELECT * FROM users WHERE lower(email) = lower(?) AND active = 1').get(email.trim());
       if (!user || !passwordMatches(password, user.password_hash)) return json(res, 401, { error: 'Invalid email or password.' });
-      const token = crypto.randomBytes(32).toString('hex');
-      sessions.set(token, { userId: user.id, expiresAt: Date.now() + SESSION_TTL_MS });
+      
+      const rawToken = crypto.randomBytes(32).toString('hex');
+      const tokenHash = hashSessionToken(rawToken);
+      const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+
+      db.prepare(`
+        INSERT INTO sessions (token_hash, user_id, pharmacy_id, expires_at)
+        VALUES (?, ?, ?, ?)
+      `).run(tokenHash, user.id, user.pharmacy_id, expiresAt);
+
       db.prepare('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?').run(user.id);
-      return json(res, 200, { user: { fullName: user.full_name, email: user.email, role: user.role } }, { 'Set-Cookie': `mediindex_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL_MS / 1000}` });
+      return json(res, 200, { user: { fullName: user.full_name, email: user.email, role: user.role } }, { 'Set-Cookie': `mediindex_session=${rawToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL_MS / 1000}` });
     } catch (error) { return json(res, 400, { error: error.message }); }
   }
   if (req.method === 'POST' && url.pathname === '/api/auth/logout') {
-    const token = parseCookies(req).mediindex_session; if (token) sessions.delete(token);
+    const rawToken = parseCookies(req).mediindex_session;
+    if (rawToken) {
+      const tokenHash = hashSessionToken(rawToken);
+      try {
+        db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+      } catch {}
+    }
     return json(res, 200, { ok: true }, { 'Set-Cookie': 'mediindex_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' });
   }
   const user = currentUser(req);
@@ -501,34 +548,7 @@ async function handler(req, res) {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
     try {
       const input = await readJson(req);
-      let payload = input.payload;
-      if (typeof payload === 'string') {
-        try {
-          payload = JSON.parse(payload.trim());
-        } catch {
-          // Check if pipe-delimited format: MEDIINDEX|v1|MED_ID|BATCH_NO
-          const parts = payload.trim().split('|');
-          if (parts.length >= 4 && parts[0] === 'MEDIINDEX') {
-            payload = {
-              app: parts[0],
-              v: Number(parts[1].replace(/^v/i, '')) || 1,
-              medicineId: Number(parts[2]),
-              batchNumber: parts[3]
-            };
-          } else {
-            throw new Error('QR payload is not recognized as a valid MediIndex code.');
-          }
-        }
-      }
-
-      if (!payload || typeof payload !== 'object') throw new Error('Invalid QR payload structure.');
-      if (payload.app !== 'MEDIINDEX') throw new Error('Unrecognized application tag. Expected MEDIINDEX.');
-      if (Number(payload.v) !== 1) throw new Error(`Unsupported QR version: ${payload.v}. Expected version 1.`);
-      
-      const medicineId = Number(payload.medicineId);
-      if (!Number.isInteger(medicineId) || medicineId <= 0) throw new Error('Invalid medicine ID in QR payload.');
-      
-      const batchNumber = cleanText(payload.batchNumber, 'Batch number', { required: true, max: 80 });
+      const { medicineId, batchNumber } = parseAndValidateQrPayload(input.payload);
 
       // Authoritative database resolution
       const row = db.prepare(`
@@ -843,10 +863,554 @@ async function handler(req, res) {
       return json(res, 400, { error: error.message });
     }
   }
+
+  // --- Mobile Device One-Time Pairing & Device Management Routes ---
+  if (req.method === 'GET' && (url.pathname === '/api/mobile/auth/verify' || url.pathname === '/api/mobile/verify')) {
+    const device = currentDevice(req);
+    if (!device) return json(res, 401, { error: 'Invalid or revoked device token.' });
+    return json(res, 200, {
+      valid: true,
+      device: {
+        id: device.id,
+        name: device.deviceName,
+        model: device.deviceModel,
+        createdAt: device.createdAt,
+        lastSeenAt: device.lastSeenAt
+      },
+      pharmacy: {
+        id: device.pharmacyId,
+        name: device.pharmacyName,
+        address: device.pharmacyAddress
+      }
+    });
+  }
+
+  if (req.method === 'POST' && (url.pathname === '/api/mobile/pairing/create' || url.pathname === '/api/mobile/pairing/generate')) {
+    if (!requireRole(res, user, 'ADMIN')) return;
+    try {
+      const pairingCode = 'MED-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+      const expiresInSeconds = 600; // 10 minutes
+      const expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
+
+      db.prepare(`
+        INSERT INTO device_pairing_codes (pharmacy_id, pairing_code, created_by, expires_at)
+        VALUES (?, ?, ?, ?)
+      `).run(user.pharmacy_id, pairingCode, user.id, expiresAt);
+
+      return json(res, 201, {
+        pairingCode,
+        expiresAt,
+        expiresInSeconds
+      });
+    } catch (error) {
+      return json(res, 400, { error: error.message });
+    }
+  }
+
+  if (req.method === 'POST' && (url.pathname === '/api/mobile/pairing/complete' || url.pathname === '/api/mobile/pairing/claim')) {
+    try {
+      const input = await readJson(req);
+      const pairingCode = cleanText(input.pairingCode || input.code, 'Pairing code', { required: true, max: 50 });
+      const deviceName = cleanText(input.deviceName || input.deviceLabel || input.name, 'Device name', { required: true, max: 100 });
+      const deviceModel = cleanText(input.deviceModel || input.model, 'Device model', { max: 100 });
+
+      db.exec('BEGIN');
+      const record = db.prepare(`
+        SELECT id, pharmacy_id, pairing_code, expires_at, used, created_by
+        FROM device_pairing_codes
+        WHERE UPPER(pairing_code) = UPPER(?)
+      `).get(pairingCode);
+
+      if (!record) {
+        db.exec('ROLLBACK');
+        return json(res, 400, { error: 'Invalid or unrecognized pairing code.' });
+      }
+
+      if (record.used === 1) {
+        db.exec('ROLLBACK');
+        return json(res, 400, { error: 'This pairing code has already been used.' });
+      }
+
+      if (new Date(record.expires_at).getTime() < Date.now()) {
+        db.exec('ROLLBACK');
+        return json(res, 400, { error: 'This pairing code has expired.' });
+      }
+
+      const updateRes = db.prepare(`
+        UPDATE device_pairing_codes
+        SET used = 1, used_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND used = 0
+      `).run(record.id);
+
+      if (updateRes.changes === 0) {
+        db.exec('ROLLBACK');
+        return json(res, 400, { error: 'This pairing code has already been claimed.' });
+      }
+
+      const rawDeviceToken = 'medidev_' + crypto.randomBytes(32).toString('hex');
+      const tokenHash = hashDeviceToken(rawDeviceToken);
+
+      const insertDevice = db.prepare(`
+        INSERT INTO paired_devices (pharmacy_id, device_name, device_model, token_hash, paired_by)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(record.pharmacy_id, deviceName, deviceModel, tokenHash, record.created_by);
+
+      const deviceId = Number(insertDevice.lastInsertRowid);
+      const pharmacy = db.prepare('SELECT id, name, address FROM pharmacies WHERE id = ?').get(record.pharmacy_id);
+
+      db.exec('COMMIT');
+
+      return json(res, 201, {
+        success: true,
+        deviceId,
+        deviceName,
+        deviceToken: rawDeviceToken,
+        pharmacy: {
+          id: pharmacy.id,
+          name: pharmacy.name,
+          address: pharmacy.address
+        },
+        pairedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch {}
+      return json(res, 400, { error: error.message });
+    }
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/mobile/devices') {
+    if (!requireRole(res, user, 'ADMIN')) return;
+    const devices = db.prepare(`
+      SELECT id, device_name, device_model, created_at, last_seen_at, revoked, revoked_at
+      FROM paired_devices
+      WHERE pharmacy_id = ?
+      ORDER BY created_at DESC
+    `).all(user.pharmacy_id);
+    return json(res, 200, { devices });
+  }
+
+  const deviceRevokeMatch = url.pathname.match(/^\/api\/mobile\/devices\/(\d+)\/revoke$/);
+  if (deviceRevokeMatch && req.method === 'POST') {
+    if (!requireRole(res, user, 'ADMIN')) return;
+    const device = db.prepare(`
+      SELECT id, pharmacy_id, device_name, revoked FROM paired_devices
+      WHERE id = ? AND pharmacy_id = ?
+    `).get(Number(deviceRevokeMatch[1]), user.pharmacy_id);
+
+    if (!device) return json(res, 404, { error: 'Device not found for this pharmacy.' });
+
+    if (device.revoked === 1) {
+      return json(res, 200, { ok: true, message: 'Device is already revoked.', deviceId: device.id });
+    }
+
+    db.prepare(`
+      UPDATE paired_devices
+      SET revoked = 1, revoked_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(device.id);
+
+    return json(res, 200, {
+      ok: true,
+      message: `Device '${device.device_name}' has been successfully revoked.`,
+      device: {
+        id: device.id,
+        deviceName: device.device_name,
+        revoked: 1,
+        revokedAt: new Date().toISOString()
+      }
+    });
+  }
+
+function processMobileStockEntry(device, input) {
+  if (!input || typeof input !== 'object') {
+    return {
+      success: false,
+      status: 'FAILED',
+      errorCode: 'INVALID_INPUT',
+      message: 'Operation payload must be an object.'
+    };
+  }
+
+  if (input.pharmacyId !== undefined || input.pharmacy_id !== undefined) {
+    return {
+      success: false,
+      status: 'FAILED',
+      errorCode: 'TENANT_SPOOFING_REJECTED',
+      message: 'Client must not supply pharmacy_id. Pharmacy context is determined authoritatively from the authenticated device.'
+    };
+  }
+
+  let medicineId, batchNumber;
+  try {
+    const qrPayloadRaw = input.qrPayload || input.payload || input;
+    const parsed = parseAndValidateQrPayload(qrPayloadRaw);
+    medicineId = parsed.medicineId;
+    batchNumber = parsed.batchNumber;
+  } catch (err) {
+    return {
+      success: false,
+      status: 'FAILED',
+      errorCode: 'INVALID_QR_PAYLOAD',
+      message: err.message
+    };
+  }
+
+  if (input.quantity === undefined || input.quantity === null || input.quantity === '') {
+    return {
+      success: false,
+      status: 'FAILED',
+      errorCode: 'QUANTITY_REQUIRED',
+      message: 'Quantity is required.'
+    };
+  }
+  const quantity = Number(input.quantity);
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    return {
+      success: false,
+      status: 'FAILED',
+      errorCode: 'INVALID_QUANTITY',
+      message: 'Quantity must be a positive whole number greater than zero.'
+    };
+  }
+  if (quantity > 100000) {
+    return {
+      success: false,
+      status: 'FAILED',
+      errorCode: 'QUANTITY_LIMIT_EXCEEDED',
+      message: 'Quantity exceeds maximum allowable limit of 100,000 units per intake transaction.'
+    };
+  }
+
+  let idempotencyKey = null;
+  try {
+    idempotencyKey = cleanText(input.idempotencyKey || input.idempotency_key, 'Idempotency key', { max: 120 });
+  } catch (err) {
+    return {
+      success: false,
+      status: 'FAILED',
+      errorCode: 'INVALID_IDEMPOTENCY_KEY',
+      message: err.message
+    };
+  }
+  let requestHash = null;
+
+  if (idempotencyKey) {
+    requestHash = crypto.createHash('sha256').update(JSON.stringify({
+      medicineId: Number(medicineId),
+      batchNumber: String(batchNumber).trim(),
+      quantity: Number(quantity)
+    })).digest('hex');
+
+    const existingKey = db.prepare(`
+      SELECT request_hash, response_status, response_body
+      FROM idempotency_keys
+      WHERE key = ? AND pharmacy_id = ?
+    `).get(idempotencyKey, device.pharmacyId);
+
+    if (existingKey) {
+      if (existingKey.request_hash !== requestHash) {
+        return {
+          success: false,
+          status: 'CONFLICT',
+          errorCode: 'IDEMPOTENCY_CONFLICT',
+          message: 'Idempotency key conflict: This idempotency key was previously used with a different request payload.'
+        };
+      }
+      const cachedBody = JSON.parse(existingKey.response_body);
+      cachedBody.idempotent = true;
+      return {
+        success: true,
+        status: 'IDEMPOTENT',
+        idempotent: true,
+        data: cachedBody
+      };
+    }
+  }
+
+  db.exec('BEGIN IMMEDIATE');
+
+  try {
+    const activeDev = db.prepare('SELECT id, revoked FROM paired_devices WHERE id = ? AND revoked = 0').get(device.id);
+    if (!activeDev) {
+      db.exec('ROLLBACK');
+      return {
+        success: false,
+        status: 'FAILED',
+        errorCode: 'DEVICE_REVOKED',
+        message: 'Device has been revoked or is no longer authorized.'
+      };
+    }
+
+    if (idempotencyKey) {
+      const lockedExistingKey = db.prepare(`
+        SELECT request_hash, response_status, response_body
+        FROM idempotency_keys
+        WHERE key = ? AND pharmacy_id = ?
+      `).get(idempotencyKey, device.pharmacyId);
+
+      if (lockedExistingKey) {
+        db.exec('ROLLBACK');
+        if (lockedExistingKey.request_hash !== requestHash) {
+          return {
+            success: false,
+            status: 'CONFLICT',
+            errorCode: 'IDEMPOTENCY_CONFLICT',
+            message: 'Idempotency key conflict: This idempotency key was previously used with a different request payload.'
+          };
+        }
+        const cachedBody = JSON.parse(lockedExistingKey.response_body);
+        cachedBody.idempotent = true;
+        return {
+          success: true,
+          status: 'IDEMPOTENT',
+          idempotent: true,
+          data: cachedBody
+        };
+      }
+    }
+
+    const medicine = db.prepare(`
+      SELECT id, name, generic_name, category
+      FROM medicines
+      WHERE id = ? AND pharmacy_id = ? AND active = 1
+    `).get(medicineId, device.pharmacyId);
+
+    if (!medicine) {
+      db.exec('ROLLBACK');
+      return {
+        success: false,
+        status: 'FAILED',
+        errorCode: 'MEDICINE_NOT_FOUND',
+        message: `Active medicine ID ${medicineId} not found for this pharmacy.`
+      };
+    }
+
+    const batch = db.prepare(`
+      SELECT id, batch_number, quantity, purchase_price, selling_price, expiry_date, location
+      FROM medicine_batches
+      WHERE medicine_id = ? AND batch_number = ?
+    `).get(medicine.id, batchNumber);
+
+    if (!batch) {
+      db.exec('ROLLBACK');
+      return {
+        success: false,
+        status: 'FAILED',
+        errorCode: 'BATCH_NOT_FOUND',
+        message: `Batch '${batchNumber}' not found for medicine '${medicine.name}'.`
+      };
+    }
+
+    db.prepare('UPDATE medicine_batches SET quantity = quantity + ? WHERE id = ?').run(quantity, batch.id);
+
+    const auditUserId = device.pairedBy || db.prepare('SELECT id FROM users WHERE pharmacy_id = ? AND role = "ADMIN" LIMIT 1').get(device.pharmacyId)?.id || 1;
+
+    const movementRes = db.prepare(`
+      INSERT INTO inventory_movements (batch_id, change_quantity, reason, created_by, device_id)
+      VALUES (?, ?, 'RECEIPT', ?, ?)
+    `).run(batch.id, quantity, auditUserId, device.id);
+    const movementId = Number(movementRes.lastInsertRowid);
+
+    const newStock = batch.quantity + quantity;
+
+    const responseData = {
+      success: true,
+      status: 'STOCK_UPDATED',
+      idempotent: false,
+      medicine: {
+        id: medicine.id,
+        name: medicine.name,
+        genericName: medicine.generic_name,
+        category: medicine.category
+      },
+      batch: {
+        id: batch.id,
+        batchNumber: batch.batch_number,
+        quantityAdded: quantity,
+        currentStock: newStock,
+        expiryDate: batch.expiry_date,
+        sellingPrice: batch.selling_price,
+        location: batch.location
+      },
+      movementId,
+      deviceId: device.id,
+      timestamp: new Date().toISOString()
+    };
+
+    if (idempotencyKey) {
+      db.prepare(`
+        INSERT INTO idempotency_keys (key, pharmacy_id, device_id, endpoint, request_hash, response_status, response_body)
+        VALUES (?, ?, ?, '/api/mobile/stock-entry', ?, 200, ?)
+      `).run(idempotencyKey, device.pharmacyId, device.id, requestHash, JSON.stringify(responseData));
+    }
+
+    db.exec('COMMIT');
+
+    refreshExpiryAlerts(device.pharmacyId);
+
+    return {
+      success: true,
+      status: 'SYNCED',
+      idempotent: false,
+      data: responseData
+    };
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch {}
+    if (error.message && error.message.includes('UNIQUE constraint failed: idempotency_keys')) {
+      try {
+        const fallbackKey = db.prepare(`
+          SELECT request_hash, response_status, response_body
+          FROM idempotency_keys
+          WHERE key = ? AND pharmacy_id = ?
+        `).get(idempotencyKey, device.pharmacyId);
+        if (fallbackKey) {
+          if (fallbackKey.request_hash !== requestHash) {
+            return {
+              success: false,
+              status: 'CONFLICT',
+              errorCode: 'IDEMPOTENCY_CONFLICT',
+              message: 'Idempotency key conflict: This idempotency key was previously used with a different request payload.'
+            };
+          }
+          const cachedBody = JSON.parse(fallbackKey.response_body);
+          cachedBody.idempotent = true;
+          return {
+            success: true,
+            status: 'IDEMPOTENT',
+            idempotent: true,
+            data: cachedBody
+          };
+        }
+      } catch {}
+    }
+    return {
+      success: false,
+      status: 'FAILED',
+      errorCode: 'OPERATION_ERROR',
+      message: error.message
+    };
+  }
+}
+
+  if (req.method === 'POST' && url.pathname === '/api/mobile/stock-entry') {
+    const device = currentDevice(req);
+    if (!device) return json(res, 401, { error: 'Device authentication required. Invalid or revoked device token.' });
+
+    try {
+      const input = await readJson(req);
+      const result = processMobileStockEntry(device, input);
+
+      if (result.success) {
+        return json(res, 200, result.data);
+      }
+
+      if (result.status === 'CONFLICT') {
+        return json(res, 409, { error: result.message });
+      }
+
+      if (result.errorCode === 'MEDICINE_NOT_FOUND' || result.errorCode === 'BATCH_NOT_FOUND') {
+        return json(res, 404, { error: result.message });
+      }
+
+      return json(res, 400, { error: result.message });
+    } catch (error) {
+      return json(res, 400, { error: error.message });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/mobile/stock-entry/batch-sync') {
+    const device = currentDevice(req);
+    if (!device) return json(res, 401, { error: 'Device authentication required. Invalid or revoked device token.' });
+
+    try {
+      const body = await readJson(req);
+
+      if (body.pharmacyId !== undefined || body.pharmacy_id !== undefined) {
+        return json(res, 400, { error: 'Client must not supply pharmacy_id. Pharmacy context is determined authoritatively from the authenticated device.' });
+      }
+
+      if (!body.operations || !Array.isArray(body.operations)) {
+        return json(res, 400, { error: 'Invalid request: "operations" must be a non-empty array.' });
+      }
+
+      if (body.operations.length === 0) {
+        return json(res, 400, { error: 'Operations array must not be empty.' });
+      }
+
+      if (body.operations.length > 100) {
+        return json(res, 400, { error: 'Batch size exceeds maximum allowable limit of 100 operations per request.' });
+      }
+
+      const results = [];
+      let syncedCount = 0;
+      let idempotentCount = 0;
+      let failedCount = 0;
+
+      for (let i = 0; i < body.operations.length; i++) {
+        const op = body.operations[i];
+        const operationId = op && op.operationId ? String(op.operationId).trim() : `op-${i + 1}`;
+        const opResult = processMobileStockEntry(device, op);
+
+        if (opResult.success) {
+          if (opResult.idempotent) {
+            idempotentCount++;
+            results.push({
+              operationId,
+              status: 'IDEMPOTENT',
+              idempotent: true,
+              movementId: opResult.data.movementId,
+              batchId: opResult.data.batch ? opResult.data.batch.id : undefined,
+              batchNumber: opResult.data.batch ? opResult.data.batch.batchNumber : undefined,
+              quantityAdded: opResult.data.batch ? opResult.data.batch.quantityAdded : undefined,
+              currentStock: opResult.data.batch ? opResult.data.batch.currentStock : undefined,
+              timestamp: opResult.data.timestamp
+            });
+          } else {
+            syncedCount++;
+            results.push({
+              operationId,
+              status: 'SYNCED',
+              idempotent: false,
+              movementId: opResult.data.movementId,
+              batchId: opResult.data.batch.id,
+              batchNumber: opResult.data.batch.batchNumber,
+              quantityAdded: opResult.data.batch.quantityAdded,
+              currentStock: opResult.data.batch.currentStock,
+              timestamp: opResult.data.timestamp
+            });
+          }
+        } else {
+          failedCount++;
+          results.push({
+            operationId,
+            status: opResult.status || 'FAILED',
+            errorCode: opResult.errorCode || 'OPERATION_FAILED',
+            message: opResult.message
+          });
+        }
+      }
+
+      return json(res, 200, {
+        success: true,
+        deviceId: device.id,
+        pharmacyId: device.pharmacyId,
+        summary: {
+          total: body.operations.length,
+          synced: syncedCount,
+          idempotent: idempotentCount,
+          failed: failedCount
+        },
+        results
+      });
+    } catch (error) {
+      return json(res, 400, { error: error.message });
+    }
+  }
+
   if (url.pathname.startsWith('/api/')) return json(res, 404, { error: 'API endpoint not found.' });
   if (!serveFile(res, url.pathname)) json(res, 404, { error: 'Not found.' });
 }
 
 const server = http.createServer((req, res) => handler(req, res).catch(error => { console.error(error); json(res, 500, { error: 'Internal server error.' }); }));
-if (require.main === module) server.listen(PORT, '127.0.0.1', () => console.log(`MediIndex running at http://127.0.0.1:${PORT}`));
-module.exports = { server, handler, passwordHash, passwordMatches };
+module.exports = { server, handler, passwordHash, passwordMatches, hashDeviceToken, hashSessionToken, currentDevice, currentUser, db, adapter, SESSION_TTL_MS };
+
