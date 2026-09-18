@@ -88,33 +88,33 @@ test('ADAPTER-SELECT-005: PostgreSQL connection string passed via options', () =
   assert.equal(adapter.connectionString, 'postgresql://test:test@localhost:5432/test');
 });
 
-test('ADAPTER-SELECT-006: server.js uses createDatabaseAdapter factory', () => {
-  // Verify server.js imports the factory, not direct adapter
+test('ADAPTER-SELECT-006: app.js uses createDatabaseAdapter factory', () => {
+  // Verify app.js imports the factory, not direct adapter
   const serverCode = require('node:fs').readFileSync(
-    require('node:path').join(__dirname, '..', 'server.js'),
+    require('node:path').join(__dirname, '..', 'app.js'),
     'utf-8'
   );
   
   // Should import createDatabaseAdapter
-  assert.match(serverCode, /createDatabaseAdapter/, 'server.js should import createDatabaseAdapter');
+  assert.match(serverCode, /createDatabaseAdapter/, 'app.js should import createDatabaseAdapter');
   
   // Should NOT directly construct SQLiteAdapter
   assert.ok(
     !serverCode.includes('new SQLiteAdapter('),
-    'server.js should NOT directly construct SQLiteAdapter'
+    'app.js should NOT directly construct SQLiteAdapter'
   );
   
   // Should use createDatabaseAdapter()
   assert.match(
     serverCode,
     /createDatabaseAdapter\(/,
-    'server.js should call createDatabaseAdapter()'
+    'app.js should call createDatabaseAdapter()'
   );
 });
 
-test('ADAPTER-SELECT-007: No in-memory session Map in server.js', () => {
+test('ADAPTER-SELECT-007: No in-memory session Map in app.js', () => {
   const serverCode = require('node:fs').readFileSync(
-    require('node:path').join(__dirname, '..', 'server.js'),
+    require('node:path').join(__dirname, '..', 'app.js'),
     'utf-8'
   );
   
@@ -122,7 +122,7 @@ test('ADAPTER-SELECT-007: No in-memory session Map in server.js', () => {
   const sessionMapPattern = /const\s+sessions\s*=\s*new\s+Map\(\)/;
   assert.ok(
     !sessionMapPattern.test(serverCode),
-    'server.js should NOT have in-memory sessions Map'
+    'app.js should NOT have in-memory sessions Map'
   );
 });
 
