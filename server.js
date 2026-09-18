@@ -1414,3 +1414,7 @@ function processMobileStockEntry(device, input) {
 const server = http.createServer((req, res) => handler(req, res).catch(error => { console.error(error); json(res, 500, { error: 'Internal server error.' }); }));
 module.exports = { server, handler, passwordHash, passwordMatches, hashDeviceToken, hashSessionToken, currentDevice, currentUser, db, adapter, SESSION_TTL_MS };
 
+
+if (require.main === module) {
+  server.listen(PORT, () => console.log(`MediIndex API running on http://localhost:${PORT}`));
+}

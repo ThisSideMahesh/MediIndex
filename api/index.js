@@ -1,12 +1,10 @@
 /**
- * Minimal Vercel Serverless Function entry point (Phase 5A Foundation)
+ * Vercel Serverless Function entry point
  * 
- * Note: This entry point provides the HTTP handler adapter for Vercel Serverless deployment.
- * Full serverless production readiness is under active development in Phase 5.
+ * Routes ALL requests (/ and /api/*) through the main application handler.
+ * The handler internally routes to API endpoints or serves static files from public/.
  */
 
 const { handler } = require('../server');
 
-module.exports = async (req, res) => {
-  return handler(req, res);
-};
+module.exports = handler;
