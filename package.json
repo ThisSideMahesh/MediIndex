@@ -4,8 +4,8 @@
   "private": true,
   "description": "Offline-first medicine inventory and expiry management system",
   "scripts": {
-    "start": "node app.js",
-    "dev": "node --watch app.js",
+    "start": "node core.js",
+    "dev": "node --watch core.js",
     "test": "node --test --test-concurrency=1 tests/*.test.js"
   },
   "engines": {

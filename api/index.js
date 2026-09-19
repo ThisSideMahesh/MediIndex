@@ -5,6 +5,6 @@
  * The handler internally routes to API endpoints or serves static files from public/.
  */
 
-const { handler } = require('../app');
+const { handler } = require('../core');
 
 module.exports = handler;

@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const { EventEmitter } = require('node:events');
-const { handler, db, hashSessionToken, SESSION_TTL_MS } = require('../app');
+const { handler, db, hashSessionToken, SESSION_TTL_MS } = require('../core');
 const { SQLiteAdapter } = require('../db/sqlite-adapter');
 const { PostgreSQLAdapter, convertPlaceholders } = require('../db/postgres-adapter');
 

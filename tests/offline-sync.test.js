@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const crypto = require('node:crypto');
-const { handler, passwordHash, hashDeviceToken, db } = require('../app');
+const { handler, passwordHash, hashDeviceToken, db } = require('../core');
 
 function callApi({ method, url, body, cookie, headers = {} } = {}) {
   return new Promise((resolve, reject) => {
