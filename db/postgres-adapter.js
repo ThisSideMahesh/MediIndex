@@ -162,7 +162,7 @@ class PostgreSQLAdapter {
     return this.pool;
   }
 
-  async initialize() {
+  initialize() {
     this.getPool();
     this.isInitialized = true;
     return this;

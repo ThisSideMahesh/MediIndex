@@ -144,15 +144,18 @@ test('ADAPTER-SELECT-008: Adapter initialization is synchronous for SQLite', () 
   }
 });
 
-test('ADAPTER-SELECT-009: PostgreSQL adapter has async initialize', () => {
+test('ADAPTER-SELECT-009: PostgreSQL adapter initialize returns adapter synchronously', () => {
   const adapter = createDatabaseAdapter({ 
     type: 'postgres',
     connectionString: 'postgresql://test:test@localhost:5432/test'
   });
   
-  // PostgreSQLAdapter.initialize() returns a Promise
+  // PostgreSQLAdapter.initialize() is synchronous (just constructs the pool object)
+  // and returns `this` — consistent with SQLiteAdapter.initialize()
   const result = adapter.initialize();
-  assert.ok(result instanceof Promise, 'PostgreSQL initialize should return Promise');
+  assert.ok(!(result instanceof Promise), 'PostgreSQL initialize must NOT return a Promise');
+  assert.ok(result === adapter, 'PostgreSQL initialize must return the adapter instance');
+  assert.ok(result.isInitialized, 'Adapter must be marked initialized');
 });
 
 test('ADAPTER-SELECT-010: Adapter type is exposed for debugging', () => {
