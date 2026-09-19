@@ -25,9 +25,59 @@ function hashSessionToken(token) {
   return crypto.createHash('sha256').update(token.trim()).digest('hex');
 }
 
-// Auto-select adapter: PostgreSQL if DATABASE_URL set, otherwise SQLite
+// Auto-select adapter: PostgreSQL if DATABASE_URL set, otherwise SQLite.
+// db IS the adapter — both SQLiteAdapter and PostgreSQLAdapter expose
+// .prepare(sql).get/run/all(), .get(), .run(), .query(), .exec(), .transaction().
 const adapter = createDatabaseAdapter({ dataDir: DATA_DIR, dbPath: DB_PATH }).initialize();
-const db = adapter.db;
+// For SQLite, initialize() is synchronous and returns `this`.
+// For PostgreSQL, initialize() returns a Promise — the await is handled inside
+// each async route handler that actually uses the db. Module-level initialization
+// only sets up the pool (PG) or opens the file (SQLite); schema is applied via
+// the PostgreSQL schema.pg.sql on first deploy, and via SQLiteAdapter.initialize()
+// for local dev.
+const db = adapter;
+
+// ─── SQL dialect helpers ───────────────────────────────────────────────────
+// SQLite uses date('now', '+N days'); PostgreSQL uses CURRENT_DATE + N.
+// Both databases accept CURRENT_DATE for "today".
+// expiry_date is TEXT in SQLite (YYYY-MM-DD) and DATE in PostgreSQL — direct
+// comparison against CURRENT_DATE works correctly on both.
+const isPg = adapter.type === 'postgres';
+// TODAY  : 'CURRENT_DATE'          — works on both SQLite and PostgreSQL
+const D_TODAY        = 'CURRENT_DATE';
+// +30    : SQLite needs the date() modifier; PostgreSQL uses integer addition
+const D_TODAY_30     = isPg ? "(CURRENT_DATE + 30)" : "date(CURRENT_DATE, '+30 days')";
+// Days-to-expiry as integer: PG uses (col - CURRENT_DATE); SQLite uses julianday diff
+const D_DAYS_LEFT    = isPg ? "(expiry_date - CURRENT_DATE)" : "CAST(julianday(expiry_date) - julianday(CURRENT_DATE) AS INTEGER)";
+// Days-to-expiry with table alias (b.expiry_date)
+const D_DAYS_LEFT_B  = isPg ? "(b.expiry_date - CURRENT_DATE)" : "CAST(julianday(b.expiry_date) - julianday(CURRENT_DATE) AS INTEGER)";
+// ISO week period for grouping: strftime('%G-W%V') on SQLite, to_char on PostgreSQL
+// Both produce 'YYYY-WNN' ISO 8601 week strings (e.g. '2026-W38').
+const D_WEEK = isPg
+  ? "to_char(s.created_at, 'IYYY-\"W\"IW')"
+  : "strftime('%G-W%V', s.created_at)";
+// Cast a timestamp/text column to a DATE value.
+// PostgreSQL: col::date  |  SQLite: date(col)
+// Used for period_start / period_end metadata in the demand forecast query
+// where s.created_at is TIMESTAMPTZ on PG and TEXT on SQLite.
+const D_DATE_OF = isPg ? (col => `${col}::date`) : (col => `date(${col})`);
+// EXPIRY_STATUS CASE expression — reused in multiple queries
+// Returns 'EXPIRED', 'EXPIRING_SOON', or 'SAFE' based on expiry_date vs today
+function expiryStatusCase(col) {
+  return `CASE WHEN ${col} < ${D_TODAY} THEN 'EXPIRED' WHEN ${col} <= ${D_TODAY_30} THEN 'EXPIRING_SOON' ELSE 'SAFE' END`;
+}
+// Duplicate-constraint error detection: SQLite says "UNIQUE constraint failed",
+// PostgreSQL says "duplicate key value violates unique constraint" (code 23505)
+function isDuplicateError(err) {
+  return (err && (
+    (err.code === '23505') ||
+    (typeof err.message === 'string' && (
+      err.message.includes('UNIQUE constraint') ||
+      err.message.includes('duplicate key') ||
+      err.message.includes('already exists')
+    ))
+  ));
+}
 
 function json(res, status, body, extraHeaders = {}) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...extraHeaders });
@@ -41,13 +91,13 @@ function parseCookies(req) {
   }));
 }
 
-function currentUser(req) {
+async function currentUser(req) {
   const token = parseCookies(req).mediindex_session;
   if (!token) return null;
   const tokenHash = hashSessionToken(token);
   if (!tokenHash) return null;
 
-  const row = db.prepare(`
+  const row = await db.prepare(`
     SELECT s.token_hash, s.user_id, s.pharmacy_id, s.expires_at,
            u.id, u.full_name, u.email, u.role, u.active
     FROM sessions s
@@ -59,7 +109,7 @@ function currentUser(req) {
 
   if (new Date(row.expires_at).getTime() < Date.now()) {
     try {
-      db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+      await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
     } catch {}
     return null;
   }
@@ -90,11 +140,11 @@ function parseDeviceToken(req) {
   return null;
 }
 
-function currentDevice(req) {
+async function currentDevice(req) {
   const rawToken = parseDeviceToken(req);
   if (!rawToken) return null;
   const tokenHash = hashDeviceToken(rawToken);
-  const row = db.prepare(`
+  const row = await db.prepare(`
     SELECT d.id, d.pharmacy_id, d.device_name, d.device_model, d.token_hash, d.paired_by, d.created_at, d.last_seen_at, d.revoked, d.revoked_at,
            p.name AS pharmacy_name, p.address AS pharmacy_address
     FROM paired_devices d
@@ -105,7 +155,7 @@ function currentDevice(req) {
   if (!row) return null;
 
   try {
-    db.prepare('UPDATE paired_devices SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?').run(row.id);
+    await db.prepare('UPDATE paired_devices SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?').run(row.id);
   } catch {}
 
   return {
@@ -130,37 +180,38 @@ function readJson(req) {
   });
 }
 
-function dashboardFor(user) {
-  refreshExpiryAlerts(user.pharmacy_id);
+async function refreshExpiryAlerts(pharmacyId) {
+  await db.prepare(`DELETE FROM expiry_alerts WHERE id IN (
+    SELECT a.id FROM expiry_alerts a JOIN medicine_batches b ON b.id=a.batch_id JOIN medicines m ON m.id=b.medicine_id
+    WHERE m.pharmacy_id=? AND ((a.alert_type='EXPIRING_SOON' AND (b.quantity=0 OR b.expiry_date<${D_TODAY} OR b.expiry_date>${D_TODAY_30})) OR (a.alert_type='EXPIRED' AND (b.quantity=0 OR b.expiry_date>=${D_TODAY})))
+  )`).run(pharmacyId);
+  await db.prepare(`INSERT INTO expiry_alerts (batch_id, alert_type)
+    SELECT b.id, CASE WHEN b.expiry_date<${D_TODAY} THEN 'EXPIRED' ELSE 'EXPIRING_SOON' END
+    FROM medicine_batches b JOIN medicines m ON m.id=b.medicine_id
+    WHERE m.pharmacy_id=? AND m.active=1 AND b.quantity>0 AND b.expiry_date<=${D_TODAY_30}
+    ON CONFLICT (batch_id, alert_type) DO NOTHING`).run(pharmacyId);
+}
+
+async function dashboardFor(user) {
+  await refreshExpiryAlerts(user.pharmacy_id);
   const pharmacyId = user.pharmacy_id;
-  const single = sql => db.prepare(sql).get(pharmacyId).value;
+  const single = async sql => (await db.prepare(sql).get(pharmacyId)).value;
   return {
-    totalMedicines: single('SELECT COUNT(*) AS value FROM medicines WHERE pharmacy_id = ? AND active = 1'),
-    totalStock: single('SELECT COALESCE(SUM(b.quantity), 0) AS value FROM medicine_batches b JOIN medicines m ON m.id = b.medicine_id WHERE m.pharmacy_id = ? AND m.active = 1'),
-    expired: single("SELECT COUNT(*) AS value FROM medicine_batches b JOIN medicines m ON m.id = b.medicine_id WHERE m.pharmacy_id = ? AND b.quantity > 0 AND date(b.expiry_date) < date('now')"),
-    expiringSoon: single("SELECT COUNT(*) AS value FROM medicine_batches b JOIN medicines m ON m.id = b.medicine_id WHERE m.pharmacy_id = ? AND b.quantity > 0 AND date(b.expiry_date) BETWEEN date('now') AND date('now', '+30 days')"),
-    lowStock: single('SELECT COUNT(*) AS value FROM medicines m WHERE m.pharmacy_id = ? AND m.active = 1 AND (SELECT COALESCE(SUM(quantity), 0) FROM medicine_batches WHERE medicine_id = m.id) <= m.minimum_stock'),
-    todaySales: single("SELECT COALESCE(SUM(total_amount), 0) AS value FROM sales WHERE pharmacy_id = ? AND date(created_at) = date('now')")
+    totalMedicines: await single('SELECT COUNT(*) AS value FROM medicines WHERE pharmacy_id = ? AND active = 1'),
+    totalStock: await single('SELECT COALESCE(SUM(b.quantity), 0) AS value FROM medicine_batches b JOIN medicines m ON m.id = b.medicine_id WHERE m.pharmacy_id = ? AND m.active = 1'),
+    expired: await single(`SELECT COUNT(*) AS value FROM medicine_batches b JOIN medicines m ON m.id = b.medicine_id WHERE m.pharmacy_id = ? AND b.quantity > 0 AND b.expiry_date < ${D_TODAY}`),
+    expiringSoon: await single(`SELECT COUNT(*) AS value FROM medicine_batches b JOIN medicines m ON m.id = b.medicine_id WHERE m.pharmacy_id = ? AND b.quantity > 0 AND b.expiry_date >= ${D_TODAY} AND b.expiry_date <= ${D_TODAY_30}`),
+    lowStock: await single('SELECT COUNT(*) AS value FROM medicines m WHERE m.pharmacy_id = ? AND m.active = 1 AND (SELECT COALESCE(SUM(quantity), 0) FROM medicine_batches WHERE medicine_id = m.id) <= m.minimum_stock'),
+    todaySales: await single(`SELECT COALESCE(SUM(total_amount), 0) AS value FROM sales WHERE pharmacy_id = ? AND ${isPg ? "created_at::date = CURRENT_DATE" : "date(created_at) = CURRENT_DATE"}`)
   };
 }
 
-function refreshExpiryAlerts(pharmacyId) {
-  db.prepare(`DELETE FROM expiry_alerts WHERE id IN (
-    SELECT a.id FROM expiry_alerts a JOIN medicine_batches b ON b.id=a.batch_id JOIN medicines m ON m.id=b.medicine_id
-    WHERE m.pharmacy_id=? AND ((a.alert_type='EXPIRING_SOON' AND (b.quantity=0 OR date(b.expiry_date)<date('now') OR date(b.expiry_date)>date('now','+30 days'))) OR (a.alert_type='EXPIRED' AND (b.quantity=0 OR date(b.expiry_date)>=date('now'))))
-  )`).run(pharmacyId);
-  db.prepare(`INSERT OR IGNORE INTO expiry_alerts (batch_id, alert_type)
-    SELECT b.id, CASE WHEN date(b.expiry_date)<date('now') THEN 'EXPIRED' ELSE 'EXPIRING_SOON' END
-    FROM medicine_batches b JOIN medicines m ON m.id=b.medicine_id
-    WHERE m.pharmacy_id=? AND m.active=1 AND b.quantity>0 AND date(b.expiry_date)<=date('now','+30 days')`).run(pharmacyId);
-}
-
-function calculateDemandForecast(pharmacyId) {
-  const medicines = db.prepare(`
+async function calculateDemandForecast(pharmacyId) {
+  const medicines = await db.prepare(`
     SELECT m.id, m.name, m.generic_name, m.category, m.minimum_stock,
            (SELECT COALESCE(SUM(b.quantity), 0) 
             FROM medicine_batches b 
-            WHERE b.medicine_id = m.id AND b.quantity > 0 AND date(b.expiry_date) >= date('now')) AS current_stock,
+            WHERE b.medicine_id = m.id AND b.quantity > 0 AND b.expiry_date >= ${D_TODAY}) AS current_stock,
            (SELECT COALESCE(SUM(si.quantity), 0)
             FROM sale_items si
             JOIN sales s ON s.id = si.sale_id
@@ -168,15 +219,14 @@ function calculateDemandForecast(pharmacyId) {
             WHERE b.medicine_id = m.id AND s.pharmacy_id = m.pharmacy_id) AS total_historical_sold
     FROM medicines m
     WHERE m.pharmacy_id = ? AND m.active = 1
-    ORDER BY m.name COLLATE NOCASE
+    ORDER BY lower(m.name)
   `).all(pharmacyId);
 
-  const forecastList = medicines.map(med => {
-    // Group sales by week
-    const periods = db.prepare(`
-      SELECT strftime('%Y-W%W', s.created_at) AS period_id,
-             MIN(date(s.created_at)) AS period_start,
-             MAX(date(s.created_at)) AS period_end,
+  const forecastList = await Promise.all(medicines.map(async med => {
+    const periods = await db.prepare(`
+      SELECT ${D_WEEK} AS period_id,
+             MIN(${D_DATE_OF('s.created_at')}) AS period_start,
+             MAX(${D_DATE_OF('s.created_at')}) AS period_end,
              SUM(si.quantity) AS quantity_sold,
              SUM(si.line_total) AS revenue,
              COUNT(DISTINCT s.id) AS sales_count
@@ -184,7 +234,7 @@ function calculateDemandForecast(pharmacyId) {
       JOIN sales s ON s.id = si.sale_id
       JOIN medicine_batches b ON b.id = si.batch_id
       WHERE b.medicine_id = ? AND s.pharmacy_id = ?
-      GROUP BY strftime('%Y-W%W', s.created_at)
+      GROUP BY ${D_WEEK}
       ORDER BY period_id DESC
       LIMIT 8
     `).all(med.id, pharmacyId);
@@ -215,8 +265,7 @@ function calculateDemandForecast(pharmacyId) {
       };
     }
 
-    // WMA calculation on 3 most recent periods
-    const p1 = periods[0].quantity_sold; // Most recent
+    const p1 = periods[0].quantity_sold;
     const p2 = periods[1].quantity_sold;
     const p3 = periods[2].quantity_sold;
 
@@ -224,16 +273,13 @@ function calculateDemandForecast(pharmacyId) {
     const weeklyForecast = (w1 * p1) + (w2 * p2) + (w3 * p3);
     const monthlyForecast = Math.round(weeklyForecast * (30 / 7));
 
-    // Historical standard deviation across the 3 periods
     const mean = (p1 + p2 + p3) / 3;
     const variance = ((p1 - mean) ** 2 + (p2 - mean) ** 2 + (p3 - mean) ** 2) / 2;
     const stdDev = Math.sqrt(variance);
-    
-    // Safety Stock at 95% service level (Z = 1.65)
+
     const calculatedSafetyStock = Math.round(1.65 * stdDev);
     const safetyStock = Math.max(med.minimum_stock, calculatedSafetyStock);
 
-    // Replenishment Quantity
     const targetInventory = monthlyForecast + safetyStock;
     const recommendedReorder = Math.max(0, targetInventory - med.current_stock);
 
@@ -275,7 +321,7 @@ function calculateDemandForecast(pharmacyId) {
       recommendedReorder,
       riskLevel
     };
-  });
+  }));
 
   const summary = {
     totalMedicines: forecastList.length,
@@ -313,12 +359,13 @@ function nonNegative(value, field, { required = false } = {}) {
   return number;
 }
 
-function medicineById(id, pharmacyId) {
-  return db.prepare('SELECT id, name, generic_name, manufacturer, category, minimum_stock, active, created_at, updated_at FROM medicines WHERE id = ? AND pharmacy_id = ?').get(id, pharmacyId);
+async function medicineById(id, pharmacyId) {
+  return await db.prepare('SELECT id, name, generic_name, manufacturer, category, minimum_stock, active, created_at, updated_at FROM medicines WHERE id = ? AND pharmacy_id = ?').get(id, pharmacyId);
 }
 
-function serializeMedicine(row) {
-  return { ...row, total_stock: db.prepare('SELECT COALESCE(SUM(quantity), 0) AS value FROM medicine_batches WHERE medicine_id = ?').get(row.id).value };
+async function serializeMedicine(row) {
+  const stockRow = await db.prepare('SELECT COALESCE(SUM(quantity), 0) AS value FROM medicine_batches WHERE medicine_id = ?').get(row.id);
+  return { ...row, total_stock: stockRow.value };
 }
 
 function parseAndValidateQrPayload(raw) {
@@ -327,7 +374,6 @@ function parseAndValidateQrPayload(raw) {
     try {
       payload = JSON.parse(payload.trim());
     } catch {
-      // Check if pipe-delimited format: MEDIINDEX|v1|MED_ID|BATCH_NO
       const parts = payload.trim().split('|');
       if (parts.length >= 4 && parts[0] === 'MEDIINDEX') {
         payload = {
@@ -364,72 +410,257 @@ function serveFile(res, requestedPath) {
   return true;
 }
 
+// processMobileStockEntry is async because PostgreSQL operations are async.
+async function processMobileStockEntry(device, input) {
+  if (!input || typeof input !== 'object') {
+    return { success: false, status: 'FAILED', errorCode: 'INVALID_INPUT', message: 'Operation payload must be an object.' };
+  }
+
+  if (input.pharmacyId !== undefined || input.pharmacy_id !== undefined) {
+    return { success: false, status: 'FAILED', errorCode: 'TENANT_SPOOFING_REJECTED', message: 'Client must not supply pharmacy_id. Pharmacy context is determined authoritatively from the authenticated device.' };
+  }
+
+  let medicineId, batchNumber;
+  try {
+    const qrPayloadRaw = input.qrPayload || input.payload || input;
+    const parsed = parseAndValidateQrPayload(qrPayloadRaw);
+    medicineId = parsed.medicineId;
+    batchNumber = parsed.batchNumber;
+  } catch (err) {
+    return { success: false, status: 'FAILED', errorCode: 'INVALID_QR_PAYLOAD', message: err.message };
+  }
+
+  if (input.quantity === undefined || input.quantity === null || input.quantity === '') {
+    return { success: false, status: 'FAILED', errorCode: 'QUANTITY_REQUIRED', message: 'Quantity is required.' };
+  }
+  const quantity = Number(input.quantity);
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    return { success: false, status: 'FAILED', errorCode: 'INVALID_QUANTITY', message: 'Quantity must be a positive whole number greater than zero.' };
+  }
+  if (quantity > 100000) {
+    return { success: false, status: 'FAILED', errorCode: 'QUANTITY_LIMIT_EXCEEDED', message: 'Quantity exceeds maximum allowable limit of 100,000 units per intake transaction.' };
+  }
+
+  let idempotencyKey = null;
+  try {
+    idempotencyKey = cleanText(input.idempotencyKey || input.idempotency_key, 'Idempotency key', { max: 120 });
+  } catch (err) {
+    return { success: false, status: 'FAILED', errorCode: 'INVALID_IDEMPOTENCY_KEY', message: err.message };
+  }
+
+  let requestHash = null;
+  if (idempotencyKey) {
+    requestHash = crypto.createHash('sha256').update(JSON.stringify({
+      medicineId: Number(medicineId),
+      batchNumber: String(batchNumber).trim(),
+      quantity: Number(quantity)
+    })).digest('hex');
+
+    const existingKey = await db.prepare(`
+      SELECT request_hash, response_status, response_body
+      FROM idempotency_keys
+      WHERE key = ? AND pharmacy_id = ?
+    `).get(idempotencyKey, device.pharmacyId);
+
+    if (existingKey) {
+      if (existingKey.request_hash !== requestHash) {
+        return { success: false, status: 'CONFLICT', errorCode: 'IDEMPOTENCY_CONFLICT', message: 'Idempotency key conflict: This idempotency key was previously used with a different request payload.' };
+      }
+      const cachedBody = JSON.parse(existingKey.response_body);
+      cachedBody.idempotent = true;
+      return { success: true, status: 'IDEMPOTENT', idempotent: true, data: cachedBody };
+    }
+  }
+
+  try {
+    return await db.transaction(async (client) => {
+      const activeDev = await client.get('SELECT id, revoked FROM paired_devices WHERE id = ? AND revoked = 0', [device.id]);
+      if (!activeDev) {
+        return { success: false, status: 'FAILED', errorCode: 'DEVICE_REVOKED', message: 'Device has been revoked or is no longer authorized.' };
+      }
+
+      if (idempotencyKey) {
+        const lockedExistingKey = await client.get(`
+          SELECT request_hash, response_status, response_body
+          FROM idempotency_keys
+          WHERE key = ? AND pharmacy_id = ?
+        `, [idempotencyKey, device.pharmacyId]);
+
+        if (lockedExistingKey) {
+          if (lockedExistingKey.request_hash !== requestHash) {
+            return { success: false, status: 'CONFLICT', errorCode: 'IDEMPOTENCY_CONFLICT', message: 'Idempotency key conflict: This idempotency key was previously used with a different request payload.' };
+          }
+          const cachedBody = JSON.parse(lockedExistingKey.response_body);
+          cachedBody.idempotent = true;
+          return { success: true, status: 'IDEMPOTENT', idempotent: true, data: cachedBody };
+        }
+      }
+
+      const medicine = await client.get(`
+        SELECT id, name, generic_name, category
+        FROM medicines
+        WHERE id = ? AND pharmacy_id = ? AND active = 1
+      `, [medicineId, device.pharmacyId]);
+
+      if (!medicine) {
+        return { success: false, status: 'FAILED', errorCode: 'MEDICINE_NOT_FOUND', message: `Active medicine ID ${medicineId} not found for this pharmacy.` };
+      }
+
+      const batch = await client.get(`
+        SELECT id, batch_number, quantity, purchase_price, selling_price, expiry_date, location
+        FROM medicine_batches
+        WHERE medicine_id = ? AND batch_number = ?
+      `, [medicine.id, batchNumber]);
+
+      if (!batch) {
+        return { success: false, status: 'FAILED', errorCode: 'BATCH_NOT_FOUND', message: `Batch '${batchNumber}' not found for medicine '${medicine.name}'.` };
+      }
+
+      await client.run('UPDATE medicine_batches SET quantity = quantity + ? WHERE id = ?', [quantity, batch.id]);
+
+      let auditUserId = device.pairedBy;
+      if (!auditUserId) {
+        const adminUser = await client.get('SELECT id FROM users WHERE pharmacy_id = ? AND role = ? LIMIT 1', [device.pharmacyId, 'ADMIN']);
+        auditUserId = adminUser ? adminUser.id : 1;
+      }
+
+      const movementRes = await client.run(`
+        INSERT INTO inventory_movements (batch_id, change_quantity, reason, created_by, device_id)
+        VALUES (?, ?, 'RECEIPT', ?, ?) RETURNING id
+      `, [batch.id, quantity, auditUserId, device.id]);
+      const movementId = Number(movementRes.lastInsertRowid);
+
+      const newStock = batch.quantity + quantity;
+
+      const responseData = {
+        success: true,
+        status: 'STOCK_UPDATED',
+        idempotent: false,
+        medicine: { id: medicine.id, name: medicine.name, genericName: medicine.generic_name, category: medicine.category },
+        batch: { id: batch.id, batchNumber: batch.batch_number, quantityAdded: quantity, currentStock: newStock, expiryDate: batch.expiry_date, sellingPrice: batch.selling_price, location: batch.location },
+        movementId,
+        deviceId: device.id,
+        timestamp: new Date().toISOString()
+      };
+
+      if (idempotencyKey) {
+        await client.run(`
+          INSERT INTO idempotency_keys (key, pharmacy_id, device_id, endpoint, request_hash, response_status, response_body)
+          VALUES (?, ?, ?, '/api/mobile/stock-entry', ?, 200, ?)
+        `, [idempotencyKey, device.pharmacyId, device.id, requestHash, JSON.stringify(responseData)]);
+      }
+
+      await refreshExpiryAlerts(device.pharmacyId);
+
+      return { success: true, status: 'SYNCED', idempotent: false, data: responseData };
+    });
+  } catch (error) {
+    if (error.message && isDuplicateError(error) && (error.message.includes('idempotency_keys') || error.message.includes('pk_idempotency_keys'))) {
+      try {
+        const fallbackKey = await db.prepare(`
+          SELECT request_hash, response_status, response_body
+          FROM idempotency_keys
+          WHERE key = ? AND pharmacy_id = ?
+        `).get(idempotencyKey, device.pharmacyId);
+        if (fallbackKey) {
+          if (fallbackKey.request_hash !== requestHash) {
+            return { success: false, status: 'CONFLICT', errorCode: 'IDEMPOTENCY_CONFLICT', message: 'Idempotency key conflict: This idempotency key was previously used with a different request payload.' };
+          }
+          const cachedBody = JSON.parse(fallbackKey.response_body);
+          cachedBody.idempotent = true;
+          return { success: true, status: 'IDEMPOTENT', idempotent: true, data: cachedBody };
+        }
+      } catch {}
+    }
+    return { success: false, status: 'FAILED', errorCode: 'OPERATION_ERROR', message: error.message };
+  }
+}
+
 async function handler(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
-  if (req.method === 'GET' && url.pathname === '/api/health') return json(res, 200, { status: 'ok', database: 'connected' });
+
+  // Health check — performs a real DB query so connectivity is verified.
+  if (req.method === 'GET' && url.pathname === '/api/health') {
+    try {
+      await db.prepare('SELECT 1 AS ok').get();
+      return json(res, 200, { status: 'ok', database: 'connected' });
+    } catch (err) {
+      return json(res, 503, { status: 'error', database: 'unavailable', message: err.message });
+    }
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/auth/login') {
     try {
       const { email, password } = await readJson(req);
       if (typeof email !== 'string' || typeof password !== 'string') return json(res, 400, { error: 'Email and password are required.' });
-      const user = db.prepare('SELECT * FROM users WHERE lower(email) = lower(?) AND active = 1').get(email.trim());
+      const user = await db.prepare('SELECT * FROM users WHERE lower(email) = lower(?) AND active = 1').get(email.trim());
       if (!user || !passwordMatches(password, user.password_hash)) return json(res, 401, { error: 'Invalid email or password.' });
-      
+
       const rawToken = crypto.randomBytes(32).toString('hex');
       const tokenHash = hashSessionToken(rawToken);
       const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
 
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO sessions (token_hash, user_id, pharmacy_id, expires_at)
         VALUES (?, ?, ?, ?)
       `).run(tokenHash, user.id, user.pharmacy_id, expiresAt);
 
-      db.prepare('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?').run(user.id);
+      await db.prepare('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?').run(user.id);
       return json(res, 200, { user: { fullName: user.full_name, email: user.email, role: user.role } }, { 'Set-Cookie': `mediindex_session=${rawToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL_MS / 1000}` });
     } catch (error) { return json(res, 400, { error: error.message }); }
   }
+
   if (req.method === 'POST' && url.pathname === '/api/auth/logout') {
     const rawToken = parseCookies(req).mediindex_session;
     if (rawToken) {
       const tokenHash = hashSessionToken(rawToken);
       try {
-        db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+        await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
       } catch {}
     }
     return json(res, 200, { ok: true }, { 'Set-Cookie': 'mediindex_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' });
   }
-  const user = currentUser(req);
+
+  const user = await currentUser(req);
+
   if (req.method === 'GET' && url.pathname === '/api/auth/me') return user ? json(res, 200, { user }) : json(res, 401, { error: 'Authentication required.' });
-  if (req.method === 'GET' && url.pathname === '/api/dashboard') return user ? json(res, 200, dashboardFor(user)) : json(res, 401, { error: 'Authentication required.' });
+
+  if (req.method === 'GET' && url.pathname === '/api/dashboard') return user ? json(res, 200, await dashboardFor(user)) : json(res, 401, { error: 'Authentication required.' });
+
   if (req.method === 'GET' && url.pathname === '/api/analytics/demand') {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
-    return json(res, 200, calculateDemandForecast(user.pharmacy_id));
+    return json(res, 200, await calculateDemandForecast(user.pharmacy_id));
   }
+
   if (req.method === 'GET' && url.pathname === '/api/expiry-alerts') {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
-    refreshExpiryAlerts(user.pharmacy_id);
+    await refreshExpiryAlerts(user.pharmacy_id);
     const status = url.searchParams.get('status') || 'ALL';
     const acknowledged = url.searchParams.get('acknowledged') || 'ALL';
-    const alerts = db.prepare(`SELECT a.id, a.alert_type, a.acknowledged, a.created_at, m.id AS medicine_id, m.name AS medicine_name, b.id AS batch_id, b.batch_number, b.quantity, b.expiry_date, b.location,
-      CAST(julianday(date(b.expiry_date))-julianday(date('now')) AS INTEGER) AS days_to_expiry
+    const alerts = await db.prepare(`SELECT a.id, a.alert_type, a.acknowledged, a.created_at, m.id AS medicine_id, m.name AS medicine_name, b.id AS batch_id, b.batch_number, b.quantity, b.expiry_date, b.location,
+      ${D_DAYS_LEFT_B} AS days_to_expiry
       FROM expiry_alerts a JOIN medicine_batches b ON b.id=a.batch_id JOIN medicines m ON m.id=b.medicine_id
       WHERE m.pharmacy_id=? AND (?='ALL' OR a.alert_type=?) AND (?='ALL' OR a.acknowledged=CAST(? AS INTEGER))
-      ORDER BY a.acknowledged ASC, CASE a.alert_type WHEN 'EXPIRED' THEN 0 ELSE 1 END, date(b.expiry_date) ASC`).all(user.pharmacy_id, status, status, acknowledged, acknowledged);
+      ORDER BY a.acknowledged ASC, CASE a.alert_type WHEN 'EXPIRED' THEN 0 ELSE 1 END, b.expiry_date ASC`).all(user.pharmacy_id, status, status, acknowledged, acknowledged);
     return json(res, 200, { alerts });
   }
+
   const acknowledgeMatch = url.pathname.match(/^\/api\/expiry-alerts\/(\d+)\/acknowledge$/);
   if (acknowledgeMatch && req.method === 'POST') {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
-    const result = db.prepare(`UPDATE expiry_alerts SET acknowledged=1 WHERE id=? AND id IN (
+    const result = await db.prepare(`UPDATE expiry_alerts SET acknowledged=1 WHERE id=? AND id IN (
       SELECT a.id FROM expiry_alerts a JOIN medicine_batches b ON b.id=a.batch_id JOIN medicines m ON m.id=b.medicine_id WHERE m.pharmacy_id=?
     )`).run(Number(acknowledgeMatch[1]), user.pharmacy_id);
     return result.changes ? json(res, 200, { ok: true }) : json(res, 404, { error: 'Alert not found.' });
   }
+
   if (req.method === 'GET' && url.pathname === '/api/medicines') {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
     const query = (url.searchParams.get('q') || '').trim();
-    const rows = db.prepare(`SELECT id, name, generic_name, manufacturer, category, minimum_stock, active, created_at, updated_at FROM medicines WHERE pharmacy_id = ? AND active = 1 AND (name LIKE ? OR generic_name LIKE ?) ORDER BY name COLLATE NOCASE`).all(user.pharmacy_id, `%${query}%`, `%${query}%`);
-    return json(res, 200, { medicines: rows.map(serializeMedicine) });
+    const rows = await db.prepare(`SELECT id, name, generic_name, manufacturer, category, minimum_stock, active, created_at, updated_at FROM medicines WHERE pharmacy_id = ? AND active = 1 AND (name LIKE ? OR generic_name LIKE ?) ORDER BY lower(name)`).all(user.pharmacy_id, `%${query}%`, `%${query}%`);
+    return json(res, 200, { medicines: await Promise.all(rows.map(serializeMedicine)) });
   }
+
   if (req.method === 'POST' && url.pathname === '/api/medicines') {
     if (!requireRole(res, user, 'ADMIN')) return;
     try {
@@ -439,15 +670,16 @@ async function handler(req, res) {
       const manufacturer = cleanText(input.manufacturer, 'Manufacturer');
       const category = cleanText(input.category, 'Category');
       const minimumStock = nonNegative(input.minimumStock, 'Minimum stock');
-      const result = db.prepare('INSERT INTO medicines (pharmacy_id, name, generic_name, manufacturer, category, minimum_stock) VALUES (?, ?, ?, ?, ?, ?)').run(user.pharmacy_id, name, generic, manufacturer, category, minimumStock);
-      return json(res, 201, { medicine: serializeMedicine(medicineById(Number(result.lastInsertRowid), user.pharmacy_id)) });
+      const result = await db.prepare('INSERT INTO medicines (pharmacy_id, name, generic_name, manufacturer, category, minimum_stock) VALUES (?, ?, ?, ?, ?, ?) RETURNING id').run(user.pharmacy_id, name, generic, manufacturer, category, minimumStock);
+      return json(res, 201, { medicine: await serializeMedicine(await medicineById(Number(result.lastInsertRowid), user.pharmacy_id)) });
     } catch (error) { return json(res, 400, { error: error.message }); }
   }
+
   const medicineMatch = url.pathname.match(/^\/api\/medicines\/(\d+)$/);
   if (medicineMatch && req.method === 'PUT') {
     if (!requireRole(res, user, 'ADMIN')) return;
     try {
-      const existing = medicineById(Number(medicineMatch[1]), user.pharmacy_id);
+      const existing = await medicineById(Number(medicineMatch[1]), user.pharmacy_id);
       if (!existing || !existing.active) return json(res, 404, { error: 'Medicine not found.' });
       const input = await readJson(req);
       const name = cleanText(input.name, 'Medicine name', { required: true });
@@ -455,29 +687,32 @@ async function handler(req, res) {
       const manufacturer = cleanText(input.manufacturer, 'Manufacturer');
       const category = cleanText(input.category, 'Category');
       const minimumStock = nonNegative(input.minimumStock, 'Minimum stock');
-      db.prepare("UPDATE medicines SET name=?, generic_name=?, manufacturer=?, category=?, minimum_stock=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(name, generic, manufacturer, category, minimumStock, existing.id);
-      return json(res, 200, { medicine: serializeMedicine(medicineById(existing.id, user.pharmacy_id)) });
+      await db.prepare("UPDATE medicines SET name=?, generic_name=?, manufacturer=?, category=?, minimum_stock=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(name, generic, manufacturer, category, minimumStock, existing.id);
+      return json(res, 200, { medicine: await serializeMedicine(await medicineById(existing.id, user.pharmacy_id)) });
     } catch (error) { return json(res, 400, { error: error.message }); }
   }
+
   if (medicineMatch && req.method === 'DELETE') {
     if (!requireRole(res, user, 'ADMIN')) return;
-    const existing = medicineById(Number(medicineMatch[1]), user.pharmacy_id);
+    const existing = await medicineById(Number(medicineMatch[1]), user.pharmacy_id);
     if (!existing || !existing.active) return json(res, 404, { error: 'Medicine not found.' });
-    db.prepare('UPDATE medicines SET active=0, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(existing.id);
+    await db.prepare('UPDATE medicines SET active=0, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(existing.id);
     return json(res, 200, { ok: true });
   }
+
   const batchListMatch = url.pathname.match(/^\/api\/medicines\/(\d+)\/batches$/);
   if (batchListMatch && req.method === 'GET') {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
-    const medicine = medicineById(Number(batchListMatch[1]), user.pharmacy_id);
+    const medicine = await medicineById(Number(batchListMatch[1]), user.pharmacy_id);
     if (!medicine || !medicine.active) return json(res, 404, { error: 'Medicine not found.' });
-    const batches = db.prepare("SELECT id, batch_number, quantity, purchase_price, selling_price, manufacturing_date, expiry_date, location, CASE WHEN date(expiry_date) < date('now') THEN 'EXPIRED' WHEN date(expiry_date) <= date('now', '+30 days') THEN 'EXPIRING_SOON' ELSE 'SAFE' END AS expiry_status FROM medicine_batches WHERE medicine_id=? ORDER BY date(expiry_date), id").all(medicine.id);
-    return json(res, 200, { medicine: serializeMedicine(medicine), batches });
+    const batches = await db.prepare(`SELECT id, batch_number, quantity, purchase_price, selling_price, manufacturing_date, expiry_date, location, ${expiryStatusCase('expiry_date')} AS expiry_status FROM medicine_batches WHERE medicine_id=? ORDER BY expiry_date, id`).all(medicine.id);
+    return json(res, 200, { medicine: await serializeMedicine(medicine), batches });
   }
+
   if (batchListMatch && req.method === 'POST') {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
     try {
-      const medicine = medicineById(Number(batchListMatch[1]), user.pharmacy_id);
+      const medicine = await medicineById(Number(batchListMatch[1]), user.pharmacy_id);
       if (!medicine || !medicine.active) return json(res, 404, { error: 'Medicine not found.' });
       const input = await readJson(req);
       const batchNumber = cleanText(input.batchNumber, 'Batch number', { required: true, max: 80 });
@@ -488,31 +723,34 @@ async function handler(req, res) {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(expiryDate) || Number.isNaN(Date.parse(expiryDate))) throw new Error('Expiry date must use YYYY-MM-DD.');
       const manufacturingDate = cleanText(input.manufacturingDate, 'Manufacturing date', { max: 10 });
       const location = cleanText(input.location, 'Location', { max: 100 });
-      const result = db.prepare('INSERT INTO medicine_batches (medicine_id, batch_number, quantity, purchase_price, selling_price, manufacturing_date, expiry_date, location) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(medicine.id, batchNumber, quantity, purchasePrice, sellingPrice, manufacturingDate, expiryDate, location);
-      db.prepare("INSERT INTO inventory_movements (batch_id, change_quantity, reason, created_by) VALUES (?, ?, 'RECEIPT', ?)").run(Number(result.lastInsertRowid), quantity, user.id);
-      return json(res, 201, { batch: db.prepare('SELECT * FROM medicine_batches WHERE id=?').get(Number(result.lastInsertRowid)) });
-    } catch (error) { return json(res, 400, { error: error.message.includes('UNIQUE constraint') ? 'This batch number already exists for the selected medicine.' : error.message }); }
+      const result = await db.prepare('INSERT INTO medicine_batches (medicine_id, batch_number, quantity, purchase_price, selling_price, manufacturing_date, expiry_date, location) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id').run(medicine.id, batchNumber, quantity, purchasePrice, sellingPrice, manufacturingDate, expiryDate, location);
+      await db.prepare("INSERT INTO inventory_movements (batch_id, change_quantity, reason, created_by) VALUES (?, ?, 'RECEIPT', ?)").run(Number(result.lastInsertRowid), quantity, user.id);
+      return json(res, 201, { batch: await db.prepare('SELECT * FROM medicine_batches WHERE id=?').get(Number(result.lastInsertRowid)) });
+    } catch (error) { return json(res, 400, { error: isDuplicateError(error) ? 'This batch number already exists for the selected medicine.' : error.message }); }
   }
+
   const adjustmentMatch = url.pathname.match(/^\/api\/batches\/(\d+)\/adjustments$/);
   if (adjustmentMatch && req.method === 'POST') {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
     try {
-      const input = await readJson(req); const change = Number(input.changeQuantity);
+      const input = await readJson(req);
+      const change = Number(input.changeQuantity);
       if (!Number.isInteger(change) || change === 0) throw new Error('Adjustment quantity must be a non-zero whole number.');
-      const batch = db.prepare('SELECT b.* FROM medicine_batches b JOIN medicines m ON m.id=b.medicine_id WHERE b.id=? AND m.pharmacy_id=? AND m.active=1').get(Number(adjustmentMatch[1]), user.pharmacy_id);
+      const batch = await db.prepare('SELECT b.* FROM medicine_batches b JOIN medicines m ON m.id=b.medicine_id WHERE b.id=? AND m.pharmacy_id=? AND m.active=1').get(Number(adjustmentMatch[1]), user.pharmacy_id);
       if (!batch) return json(res, 404, { error: 'Batch not found.' });
       if (batch.quantity + change < 0) return json(res, 400, { error: 'Adjustment would reduce stock below zero.' });
-      db.exec('BEGIN');
-      db.prepare('UPDATE medicine_batches SET quantity=quantity + ? WHERE id=?').run(change, batch.id);
-      db.prepare("INSERT INTO inventory_movements (batch_id, change_quantity, reason, created_by) VALUES (?, ?, 'ADJUSTMENT', ?)").run(batch.id, change, user.id);
-      db.exec('COMMIT');
-      return json(res, 200, { batch: db.prepare('SELECT * FROM medicine_batches WHERE id=?').get(batch.id) });
-    } catch (error) { try { db.exec('ROLLBACK'); } catch {} return json(res, 400, { error: error.message }); }
+      await db.transaction(async (client) => {
+        await client.run('UPDATE medicine_batches SET quantity=quantity + ? WHERE id=?', [change, batch.id]);
+        await client.run("INSERT INTO inventory_movements (batch_id, change_quantity, reason, created_by) VALUES (?, ?, 'ADJUSTMENT', ?)", [batch.id, change, user.id]);
+      });
+      return json(res, 200, { batch: await db.prepare('SELECT * FROM medicine_batches WHERE id=?').get(batch.id) });
+    } catch (error) { return json(res, 400, { error: error.message }); }
   }
+
   const batchQrMatch = url.pathname.match(/^\/api\/batches\/(\d+)\/qr$/);
   if (batchQrMatch && req.method === 'GET') {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
-    const row = db.prepare(`
+    const row = await db.prepare(`
       SELECT b.id AS batch_id, b.batch_number, b.quantity, b.selling_price, b.expiry_date, b.location,
              m.id AS medicine_id, m.name AS medicine_name, m.generic_name, m.category
       FROM medicine_batches b
@@ -521,84 +759,44 @@ async function handler(req, res) {
     `).get(Number(batchQrMatch[1]), user.pharmacy_id);
     if (!row) return json(res, 404, { error: 'Batch not found.' });
 
-    const payload = {
-      app: 'MEDIINDEX',
-      v: 1,
-      medicineId: row.medicine_id,
-      batchNumber: row.batch_number
-    };
-
+    const payload = { app: 'MEDIINDEX', v: 1, medicineId: row.medicine_id, batchNumber: row.batch_number };
     return json(res, 200, {
       payload,
       payloadString: JSON.stringify(payload),
       sticker: {
-        medicineId: row.medicine_id,
-        medicineName: row.medicine_name,
-        genericName: row.generic_name,
-        category: row.category,
-        batchNumber: row.batch_number,
-        expiryDate: row.expiry_date,
-        sellingPrice: row.selling_price,
-        currentStock: row.quantity,
-        location: row.location
+        medicineId: row.medicine_id, medicineName: row.medicine_name, genericName: row.generic_name,
+        category: row.category, batchNumber: row.batch_number, expiryDate: row.expiry_date,
+        sellingPrice: row.selling_price, currentStock: row.quantity, location: row.location
       }
     });
   }
+
   if (req.method === 'POST' && url.pathname === '/api/qr/lookup') {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
     try {
       const input = await readJson(req);
       const { medicineId, batchNumber } = parseAndValidateQrPayload(input.payload);
-
-      // Authoritative database resolution
-      const row = db.prepare(`
+      const row = await db.prepare(`
         SELECT b.id AS batch_id, b.batch_number, b.quantity, b.purchase_price, b.selling_price,
                b.manufacturing_date, b.expiry_date, b.location,
-               CASE 
-                 WHEN date(b.expiry_date) < date('now') THEN 'EXPIRED'
-                 WHEN date(b.expiry_date) <= date('now', '+30 days') THEN 'EXPIRING_SOON'
-                 ELSE 'SAFE'
-               END AS expiry_status,
+               ${expiryStatusCase('b.expiry_date')} AS expiry_status,
                m.id AS medicine_id, m.name AS medicine_name, m.generic_name, m.manufacturer, m.category, m.minimum_stock
         FROM medicine_batches b
         JOIN medicines m ON m.id = b.medicine_id
         WHERE m.id = ? AND b.batch_number = ? AND m.pharmacy_id = ? AND m.active = 1
       `).get(medicineId, batchNumber, user.pharmacy_id);
-
-      if (!row) {
-        return json(res, 404, { error: `No active medicine batch found for ID ${medicineId} and lot '${batchNumber}'.` });
-      }
-
+      if (!row) return json(res, 404, { error: `No active medicine batch found for ID ${medicineId} and lot '${batchNumber}'.` });
       return json(res, 200, {
-        valid: true,
-        authoritative: true,
-        medicine: {
-          id: row.medicine_id,
-          name: row.medicine_name,
-          genericName: row.generic_name,
-          manufacturer: row.manufacturer,
-          category: row.category,
-          minimumStock: row.minimum_stock
-        },
-        batch: {
-          id: row.batch_id,
-          batchNumber: row.batch_number,
-          quantity: row.quantity,
-          purchasePrice: row.purchase_price,
-          sellingPrice: row.selling_price,
-          manufacturingDate: row.manufacturing_date,
-          expiryDate: row.expiry_date,
-          expiryStatus: row.expiry_status,
-          location: row.location
-        }
+        valid: true, authoritative: true,
+        medicine: { id: row.medicine_id, name: row.medicine_name, genericName: row.generic_name, manufacturer: row.manufacturer, category: row.category, minimumStock: row.minimum_stock },
+        batch: { id: row.batch_id, batchNumber: row.batch_number, quantity: row.quantity, purchasePrice: row.purchase_price, sellingPrice: row.selling_price, manufacturingDate: row.manufacturing_date, expiryDate: row.expiry_date, expiryStatus: row.expiry_status, location: row.location }
       });
-    } catch (err) {
-      return json(res, 400, { error: err.message });
-    }
+    } catch (err) { return json(res, 400, { error: err.message }); }
   }
+
   if (req.method === 'GET' && url.pathname === '/api/layout/shelves') {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
-    refreshExpiryAlerts(user.pharmacy_id);
+    await refreshExpiryAlerts(user.pharmacy_id);
 
     const standardShelves = [
       { id: 'Rack A1', rack: 'RACK_A', label: 'A1 - Fast Moving Analgesics', zone: 'Front Left', description: 'Paracetamol, Ibuprofen, Aspirin' },
@@ -617,14 +815,10 @@ async function handler(req, res) {
       { id: 'Cold Storage F2', rack: 'RACK_COLD', label: 'Cold Bay F2 - Vaccines & Sera (2-8°C)', zone: 'Cold Refrigerator', description: 'Tetanus Toxoid, Rabies Vaccines' }
     ];
 
-    const rows = db.prepare(`
+    const rows = await db.prepare(`
       SELECT b.id AS batch_id, b.batch_number, b.quantity, b.selling_price, b.purchase_price,
              b.manufacturing_date, b.expiry_date, b.location,
-             CASE 
-               WHEN date(b.expiry_date) < date('now') THEN 'EXPIRED'
-               WHEN date(b.expiry_date) <= date('now', '+30 days') THEN 'EXPIRING_SOON'
-               ELSE 'SAFE'
-             END AS expiry_status,
+             ${expiryStatusCase('b.expiry_date')} AS expiry_status,
              m.id AS medicine_id, m.name AS medicine_name, m.generic_name, m.category, m.minimum_stock
       FROM medicine_batches b
       JOIN medicines m ON m.id = b.medicine_id
@@ -633,75 +827,43 @@ async function handler(req, res) {
     `).all(user.pharmacy_id);
 
     const shelfMap = new Map();
-    standardShelves.forEach(s => {
-      shelfMap.set(s.id.toLowerCase(), {
-        ...s,
-        totalBatches: 0,
-        totalUnits: 0,
-        expiredBatches: 0,
-        expiringSoonBatches: 0,
-        batches: []
-      });
-    });
-
+    standardShelves.forEach(s => shelfMap.set(s.id.toLowerCase(), { ...s, totalBatches: 0, totalUnits: 0, expiredBatches: 0, expiringSoonBatches: 0, batches: [] }));
     const unassignedBatches = [];
 
     rows.forEach(r => {
       const locKey = (r.location || '').trim().toLowerCase();
       let matchedShelf = null;
       for (const [key, shelf] of shelfMap.entries()) {
-        if (locKey === key || locKey.includes(key) || (key.includes(locKey) && locKey.length > 2)) {
-          matchedShelf = shelf;
-          break;
-        }
+        if (locKey === key || locKey.includes(key) || (key.includes(locKey) && locKey.length > 2)) { matchedShelf = shelf; break; }
       }
-
       const batchItem = {
-        id: r.batch_id,
-        batchNumber: r.batch_number,
-        quantity: r.quantity,
-        sellingPrice: r.selling_price,
-        expiryDate: r.expiry_date,
-        expiryStatus: r.expiry_status,
+        id: r.batch_id, batchNumber: r.batch_number, quantity: r.quantity,
+        sellingPrice: r.selling_price, expiryDate: r.expiry_date, expiryStatus: r.expiry_status,
         location: r.location || 'Unassigned',
-        medicine: {
-          id: r.medicine_id,
-          name: r.medicine_name,
-          genericName: r.generic_name,
-          category: r.category
-        }
+        medicine: { id: r.medicine_id, name: r.medicine_name, genericName: r.generic_name, category: r.category }
       };
-
       if (matchedShelf) {
-        matchedShelf.totalBatches += 1;
-        matchedShelf.totalUnits += r.quantity;
+        matchedShelf.totalBatches += 1; matchedShelf.totalUnits += r.quantity;
         if (r.expiry_status === 'EXPIRED') matchedShelf.expiredBatches += 1;
         if (r.expiry_status === 'EXPIRING_SOON') matchedShelf.expiringSoonBatches += 1;
         matchedShelf.batches.push(batchItem);
-      } else {
-        unassignedBatches.push(batchItem);
-      }
+      } else { unassignedBatches.push(batchItem); }
     });
 
     const shelves = Array.from(shelfMap.values());
-    const totalInventoryUnits = rows.reduce((sum, r) => sum + r.quantity, 0);
-
     return json(res, 200, {
       layoutName: 'Standard Community Pharmacy Floor Plan',
       totalShelves: shelves.length,
-      totalUnits: totalInventoryUnits,
+      totalUnits: rows.reduce((sum, r) => sum + r.quantity, 0),
       shelves,
-      unassigned: {
-        totalBatches: unassignedBatches.length,
-        totalUnits: unassignedBatches.reduce((sum, b) => sum + b.quantity, 0),
-        batches: unassignedBatches
-      }
+      unassigned: { totalBatches: unassignedBatches.length, totalUnits: unassignedBatches.reduce((sum, b) => sum + b.quantity, 0), batches: unassignedBatches }
     });
   }
+
   if (req.method === 'GET' && url.pathname === '/api/sales') {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
     const query = (url.searchParams.get('q') || '').trim();
-    const rows = db.prepare(`
+    const rows = await db.prepare(`
       SELECT s.id, s.invoice_number, s.customer_name, s.customer_phone, s.payment_method, s.total_amount, s.created_at,
              u.full_name AS cashier_name,
              (SELECT COUNT(*) FROM sale_items WHERE sale_id = s.id) AS total_items,
@@ -714,18 +876,18 @@ async function handler(req, res) {
     `).all(user.pharmacy_id, `%${query}%`, `%${query}%`);
     return json(res, 200, { sales: rows });
   }
+
   const saleDetailMatch = url.pathname.match(/^\/api\/sales\/(\d+)$/);
   if (saleDetailMatch && req.method === 'GET') {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
-    const sale = db.prepare(`
+    const sale = await db.prepare(`
       SELECT s.id, s.invoice_number, s.customer_name, s.customer_phone, s.payment_method, s.total_amount, s.created_at,
              u.full_name AS cashier_name
-      FROM sales s
-      JOIN users u ON u.id = s.created_by
+      FROM sales s JOIN users u ON u.id = s.created_by
       WHERE s.id = ? AND s.pharmacy_id = ?
     `).get(Number(saleDetailMatch[1]), user.pharmacy_id);
     if (!sale) return json(res, 404, { error: 'Sale record not found.' });
-    const items = db.prepare(`
+    const items = await db.prepare(`
       SELECT si.id, si.quantity, si.unit_price, si.line_total,
              b.batch_number, b.expiry_date,
              m.id AS medicine_id, m.name AS medicine_name, m.generic_name
@@ -737,6 +899,7 @@ async function handler(req, res) {
     `).all(sale.id);
     return json(res, 200, { sale: { ...sale, items } });
   }
+
   if (req.method === 'POST' && url.pathname === '/api/sales') {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
     try {
@@ -756,132 +919,91 @@ async function handler(req, res) {
         return { medicineId, quantity, batchId };
       });
 
-      db.exec('BEGIN');
-      const allocations = [];
+      const saleData = await db.transaction(async (client) => {
+        const allocations = [];
 
-      for (const item of requestedItems) {
-        const medicine = db.prepare('SELECT id, name FROM medicines WHERE id = ? AND pharmacy_id = ? AND active = 1').get(item.medicineId, user.pharmacy_id);
-        if (!medicine) throw new Error(`Medicine ID ${item.medicineId} not found or is inactive.`);
+        for (const item of requestedItems) {
+          const medicine = await client.get('SELECT id, name FROM medicines WHERE id = ? AND pharmacy_id = ? AND active = 1', [item.medicineId, user.pharmacy_id]);
+          if (!medicine) throw new Error(`Medicine ID ${item.medicineId} not found or is inactive.`);
 
-        if (item.batchId) {
-          const batch = db.prepare(`
-            SELECT b.id, b.batch_number, b.quantity, b.selling_price, b.expiry_date
-            FROM medicine_batches b
-            WHERE b.id = ? AND b.medicine_id = ?
-          `).get(item.batchId, medicine.id);
-          if (!batch) throw new Error(`Batch ID ${item.batchId} not found for medicine ${medicine.name}.`);
-          if (new Date(batch.expiry_date) < new Date(new Date().toISOString().slice(0, 10))) {
-            throw new Error(`Cannot dispense expired batch ${batch.batch_number} for medicine ${medicine.name}.`);
-          }
-          if (batch.quantity < item.quantity) {
-            throw new Error(`Insufficient stock in batch ${batch.batch_number} for ${medicine.name}. Requested: ${item.quantity}, Available: ${batch.quantity}.`);
-          }
-          allocations.push({
-            batchId: batch.id,
-            medicineId: medicine.id,
-            medicineName: medicine.name,
-            batchNumber: batch.batch_number,
-            quantity: item.quantity,
-            unitPrice: batch.selling_price,
-            lineTotal: Math.round(item.quantity * batch.selling_price * 100) / 100
-          });
-        } else {
-          // FEFO automatic batch allocation (First-Expired, First-Out)
-          const batches = db.prepare(`
-            SELECT b.id, b.batch_number, b.quantity, b.selling_price, b.expiry_date
-            FROM medicine_batches b
-            WHERE b.medicine_id = ? AND b.quantity > 0 AND date(b.expiry_date) >= date('now')
-            ORDER BY date(b.expiry_date) ASC, b.id ASC
-          `).all(medicine.id);
-
-          const totalAvailable = batches.reduce((sum, b) => sum + b.quantity, 0);
-          if (totalAvailable < item.quantity) {
-            throw new Error(`Insufficient stock for ${medicine.name}. Requested: ${item.quantity}, Available: ${totalAvailable}.`);
-          }
-
-          let needed = item.quantity;
-          for (const b of batches) {
-            if (needed <= 0) break;
-            const take = Math.min(b.quantity, needed);
-            allocations.push({
-              batchId: b.id,
-              medicineId: medicine.id,
-              medicineName: medicine.name,
-              batchNumber: b.batch_number,
-              quantity: take,
-              unitPrice: b.selling_price,
-              lineTotal: Math.round(take * b.selling_price * 100) / 100
-            });
-            needed -= take;
+          if (item.batchId) {
+            const batch = await client.get(`
+              SELECT b.id, b.batch_number, b.quantity, b.selling_price, b.expiry_date
+              FROM medicine_batches b WHERE b.id = ? AND b.medicine_id = ?
+            `, [item.batchId, medicine.id]);
+            if (!batch) throw new Error(`Batch ID ${item.batchId} not found for medicine ${medicine.name}.`);
+            if (new Date(batch.expiry_date) < new Date(new Date().toISOString().slice(0, 10))) {
+              throw new Error(`Cannot dispense expired batch ${batch.batch_number} for medicine ${medicine.name}.`);
+            }
+            if (batch.quantity < item.quantity) {
+              throw new Error(`Insufficient stock in batch ${batch.batch_number} for ${medicine.name}. Requested: ${item.quantity}, Available: ${batch.quantity}.`);
+            }
+            allocations.push({ batchId: batch.id, medicineId: medicine.id, medicineName: medicine.name, batchNumber: batch.batch_number, quantity: item.quantity, unitPrice: batch.selling_price, lineTotal: Math.round(item.quantity * batch.selling_price * 100) / 100 });
+          } else {
+            // FEFO automatic batch allocation (First-Expired, First-Out)
+            const batches = await client.query(`
+              SELECT b.id, b.batch_number, b.quantity, b.selling_price, b.expiry_date
+              FROM medicine_batches b
+              WHERE b.medicine_id = ? AND b.quantity > 0 AND b.expiry_date >= ${D_TODAY}
+              ORDER BY b.expiry_date ASC, b.id ASC
+            `, [medicine.id]);
+            const totalAvailable = batches.reduce((sum, b) => sum + b.quantity, 0);
+            if (totalAvailable < item.quantity) throw new Error(`Insufficient stock for ${medicine.name}. Requested: ${item.quantity}, Available: ${totalAvailable}.`);
+            let needed = item.quantity;
+            for (const b of batches) {
+              if (needed <= 0) break;
+              const take = Math.min(b.quantity, needed);
+              allocations.push({ batchId: b.id, medicineId: medicine.id, medicineName: medicine.name, batchNumber: b.batch_number, quantity: take, unitPrice: b.selling_price, lineTotal: Math.round(take * b.selling_price * 100) / 100 });
+              needed -= take;
+            }
           }
         }
-      }
 
-      const totalAmount = Math.round(allocations.reduce((sum, a) => sum + a.lineTotal, 0) * 100) / 100;
-      const now = new Date();
-      const datePart = now.toISOString().slice(0, 10).replace(/-/g, '');
-      const countToday = db.prepare("SELECT COUNT(*) AS count FROM sales WHERE pharmacy_id = ? AND date(created_at) = date('now')").get(user.pharmacy_id).count;
-      const invoiceNumber = `INV-${datePart}-${String(countToday + 1).padStart(4, '0')}`;
+        const totalAmount = Math.round(allocations.reduce((sum, a) => sum + a.lineTotal, 0) * 100) / 100;
+        const now = new Date();
+        const datePart = now.toISOString().slice(0, 10).replace(/-/g, '');
+        const countRow = await client.get(`SELECT COUNT(*) AS count FROM sales WHERE pharmacy_id = ? AND ${isPg ? "created_at::date = CURRENT_DATE" : "date(created_at) = CURRENT_DATE"}`, [user.pharmacy_id]);
+        const invoiceNumber = `INV-${datePart}-${String(countRow.count + 1).padStart(4, '0')}`;
 
-      const saleResult = db.prepare(`
-        INSERT INTO sales (pharmacy_id, invoice_number, customer_name, customer_phone, payment_method, total_amount, created_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(user.pharmacy_id, invoiceNumber, customerName, customerPhone, paymentMethod, totalAmount, user.id);
-      const saleId = Number(saleResult.lastInsertRowid);
+        const saleResult = await client.run(`
+          INSERT INTO sales (pharmacy_id, invoice_number, customer_name, customer_phone, payment_method, total_amount, created_by)
+          VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id
+        `, [user.pharmacy_id, invoiceNumber, customerName, customerPhone, paymentMethod, totalAmount, user.id]);
+        const saleId = Number(saleResult.lastInsertRowid);
 
-      const insertItem = db.prepare(`
-        INSERT INTO sale_items (sale_id, batch_id, quantity, unit_price, line_total)
-        VALUES (?, ?, ?, ?, ?)
-      `);
-      const updateBatchStock = db.prepare('UPDATE medicine_batches SET quantity = quantity - ? WHERE id = ?');
-      const insertMovement = db.prepare("INSERT INTO inventory_movements (batch_id, change_quantity, reason, created_by) VALUES (?, ?, 'SALE', ?)");
+        for (const a of allocations) {
+          await client.run('INSERT INTO sale_items (sale_id, batch_id, quantity, unit_price, line_total) VALUES (?, ?, ?, ?, ?)', [saleId, a.batchId, a.quantity, a.unitPrice, a.lineTotal]);
+          await client.run('UPDATE medicine_batches SET quantity = quantity - ? WHERE id = ?', [a.quantity, a.batchId]);
+          await client.run("INSERT INTO inventory_movements (batch_id, change_quantity, reason, created_by) VALUES (?, ?, 'SALE', ?)", [a.batchId, -a.quantity, user.id]);
+        }
 
-      for (const a of allocations) {
-        insertItem.run(saleId, a.batchId, a.quantity, a.unitPrice, a.lineTotal);
-        updateBatchStock.run(a.quantity, a.batchId);
-        insertMovement.run(a.batchId, -a.quantity, user.id);
-      }
+        return { saleId, invoiceNumber, totalAmount, allocations };
+      });
 
-      db.exec('COMMIT');
-      refreshExpiryAlerts(user.pharmacy_id);
+      await refreshExpiryAlerts(user.pharmacy_id);
 
       return json(res, 201, {
         sale: {
-          id: saleId,
-          invoice_number: invoiceNumber,
-          customer_name: customerName,
-          customer_phone: customerPhone,
-          payment_method: paymentMethod,
-          total_amount: totalAmount,
-          created_at: new Date().toISOString(),
-          cashier: user.full_name,
-          items: allocations
+          id: saleData.saleId, invoice_number: saleData.invoiceNumber,
+          customer_name: customerName, customer_phone: customerPhone,
+          payment_method: paymentMethod, total_amount: saleData.totalAmount,
+          created_at: new Date().toISOString(), cashier: user.full_name,
+          items: saleData.allocations
         }
       });
     } catch (error) {
-      try { db.exec('ROLLBACK'); } catch {}
       return json(res, 400, { error: error.message });
     }
   }
 
-  // --- Mobile Device One-Time Pairing & Device Management Routes ---
+  // Mobile Device One-Time Pairing & Device Management Routes
   if (req.method === 'GET' && (url.pathname === '/api/mobile/auth/verify' || url.pathname === '/api/mobile/verify')) {
-    const device = currentDevice(req);
+    const device = await currentDevice(req);
     if (!device) return json(res, 401, { error: 'Invalid or revoked device token.' });
     return json(res, 200, {
       valid: true,
-      device: {
-        id: device.id,
-        name: device.deviceName,
-        model: device.deviceModel,
-        createdAt: device.createdAt,
-        lastSeenAt: device.lastSeenAt
-      },
-      pharmacy: {
-        id: device.pharmacyId,
-        name: device.pharmacyName,
-        address: device.pharmacyAddress
-      }
+      device: { id: device.id, name: device.deviceName, model: device.deviceModel, createdAt: device.createdAt, lastSeenAt: device.lastSeenAt },
+      pharmacy: { id: device.pharmacyId, name: device.pharmacyName, address: device.pharmacyAddress }
     });
   }
 
@@ -889,22 +1011,14 @@ async function handler(req, res) {
     if (!requireRole(res, user, 'ADMIN')) return;
     try {
       const pairingCode = 'MED-' + crypto.randomBytes(3).toString('hex').toUpperCase();
-      const expiresInSeconds = 600; // 10 minutes
+      const expiresInSeconds = 600;
       const expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
-
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO device_pairing_codes (pharmacy_id, pairing_code, created_by, expires_at)
         VALUES (?, ?, ?, ?)
       `).run(user.pharmacy_id, pairingCode, user.id, expiresAt);
-
-      return json(res, 201, {
-        pairingCode,
-        expiresAt,
-        expiresInSeconds
-      });
-    } catch (error) {
-      return json(res, 400, { error: error.message });
-    }
+      return json(res, 201, { pairingCode, expiresAt, expiresInSeconds });
+    } catch (error) { return json(res, 400, { error: error.message }); }
   }
 
   if (req.method === 'POST' && (url.pathname === '/api/mobile/pairing/complete' || url.pathname === '/api/mobile/pairing/claim')) {
@@ -914,77 +1028,51 @@ async function handler(req, res) {
       const deviceName = cleanText(input.deviceName || input.deviceLabel || input.name, 'Device name', { required: true, max: 100 });
       const deviceModel = cleanText(input.deviceModel || input.model, 'Device model', { max: 100 });
 
-      db.exec('BEGIN');
-      const record = db.prepare(`
-        SELECT id, pharmacy_id, pairing_code, expires_at, used, created_by
-        FROM device_pairing_codes
-        WHERE UPPER(pairing_code) = UPPER(?)
-      `).get(pairingCode);
+      const pairingResult = await db.transaction(async (client) => {
+        const record = await client.get(`
+          SELECT id, pharmacy_id, pairing_code, expires_at, used, created_by
+          FROM device_pairing_codes
+          WHERE UPPER(pairing_code) = UPPER(?)
+        `, [pairingCode]);
 
-      if (!record) {
-        db.exec('ROLLBACK');
-        return json(res, 400, { error: 'Invalid or unrecognized pairing code.' });
-      }
+        if (!record) throw Object.assign(new Error('Invalid or unrecognized pairing code.'), { status: 400 });
+        if (record.used === 1) throw Object.assign(new Error('This pairing code has already been used.'), { status: 400 });
+        if (new Date(record.expires_at).getTime() < Date.now()) throw Object.assign(new Error('This pairing code has expired.'), { status: 400 });
 
-      if (record.used === 1) {
-        db.exec('ROLLBACK');
-        return json(res, 400, { error: 'This pairing code has already been used.' });
-      }
+        const updateRes = await client.run(`
+          UPDATE device_pairing_codes SET used = 1, used_at = CURRENT_TIMESTAMP
+          WHERE id = ? AND used = 0
+        `, [record.id]);
+        if (updateRes.changes === 0) throw Object.assign(new Error('This pairing code has already been claimed.'), { status: 400 });
 
-      if (new Date(record.expires_at).getTime() < Date.now()) {
-        db.exec('ROLLBACK');
-        return json(res, 400, { error: 'This pairing code has expired.' });
-      }
+        const rawDeviceToken = 'medidev_' + crypto.randomBytes(32).toString('hex');
+        const tokenHash = hashDeviceToken(rawDeviceToken);
 
-      const updateRes = db.prepare(`
-        UPDATE device_pairing_codes
-        SET used = 1, used_at = CURRENT_TIMESTAMP
-        WHERE id = ? AND used = 0
-      `).run(record.id);
+        const insertDevice = await client.run(`
+          INSERT INTO paired_devices (pharmacy_id, device_name, device_model, token_hash, paired_by)
+          VALUES (?, ?, ?, ?, ?) RETURNING id
+        `, [record.pharmacy_id, deviceName, deviceModel, tokenHash, record.created_by]);
 
-      if (updateRes.changes === 0) {
-        db.exec('ROLLBACK');
-        return json(res, 400, { error: 'This pairing code has already been claimed.' });
-      }
+        const deviceId = Number(insertDevice.lastInsertRowid);
+        const pharmacy = await client.get('SELECT id, name, address FROM pharmacies WHERE id = ?', [record.pharmacy_id]);
 
-      const rawDeviceToken = 'medidev_' + crypto.randomBytes(32).toString('hex');
-      const tokenHash = hashDeviceToken(rawDeviceToken);
-
-      const insertDevice = db.prepare(`
-        INSERT INTO paired_devices (pharmacy_id, device_name, device_model, token_hash, paired_by)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(record.pharmacy_id, deviceName, deviceModel, tokenHash, record.created_by);
-
-      const deviceId = Number(insertDevice.lastInsertRowid);
-      const pharmacy = db.prepare('SELECT id, name, address FROM pharmacies WHERE id = ?').get(record.pharmacy_id);
-
-      db.exec('COMMIT');
+        return { deviceId, rawDeviceToken, pharmacy };
+      });
 
       return json(res, 201, {
-        success: true,
-        deviceId,
-        deviceName,
-        deviceToken: rawDeviceToken,
-        pharmacy: {
-          id: pharmacy.id,
-          name: pharmacy.name,
-          address: pharmacy.address
-        },
+        success: true, deviceId: pairingResult.deviceId, deviceName,
+        deviceToken: pairingResult.rawDeviceToken,
+        pharmacy: { id: pairingResult.pharmacy.id, name: pairingResult.pharmacy.name, address: pairingResult.pharmacy.address },
         pairedAt: new Date().toISOString()
       });
-    } catch (error) {
-      try { db.exec('ROLLBACK'); } catch {}
-      return json(res, 400, { error: error.message });
-    }
+    } catch (error) { return json(res, error.status || 400, { error: error.message }); }
   }
 
   if (req.method === 'GET' && url.pathname === '/api/mobile/devices') {
     if (!requireRole(res, user, 'ADMIN')) return;
-    const devices = db.prepare(`
+    const devices = await db.prepare(`
       SELECT id, device_name, device_model, created_at, last_seen_at, revoked, revoked_at
-      FROM paired_devices
-      WHERE pharmacy_id = ?
-      ORDER BY created_at DESC
+      FROM paired_devices WHERE pharmacy_id = ? ORDER BY created_at DESC
     `).all(user.pharmacy_id);
     return json(res, 200, { devices });
   }
@@ -992,419 +1080,62 @@ async function handler(req, res) {
   const deviceRevokeMatch = url.pathname.match(/^\/api\/mobile\/devices\/(\d+)\/revoke$/);
   if (deviceRevokeMatch && req.method === 'POST') {
     if (!requireRole(res, user, 'ADMIN')) return;
-    const device = db.prepare(`
+    const device = await db.prepare(`
       SELECT id, pharmacy_id, device_name, revoked FROM paired_devices
       WHERE id = ? AND pharmacy_id = ?
     `).get(Number(deviceRevokeMatch[1]), user.pharmacy_id);
-
     if (!device) return json(res, 404, { error: 'Device not found for this pharmacy.' });
-
-    if (device.revoked === 1) {
-      return json(res, 200, { ok: true, message: 'Device is already revoked.', deviceId: device.id });
-    }
-
-    db.prepare(`
-      UPDATE paired_devices
-      SET revoked = 1, revoked_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(device.id);
-
-    return json(res, 200, {
-      ok: true,
-      message: `Device '${device.device_name}' has been successfully revoked.`,
-      device: {
-        id: device.id,
-        deviceName: device.device_name,
-        revoked: 1,
-        revokedAt: new Date().toISOString()
-      }
-    });
+    if (device.revoked === 1) return json(res, 200, { ok: true, message: 'Device is already revoked.', deviceId: device.id });
+    await db.prepare(`UPDATE paired_devices SET revoked = 1, revoked_at = CURRENT_TIMESTAMP WHERE id = ?`).run(device.id);
+    return json(res, 200, { ok: true, message: `Device '${device.device_name}' has been successfully revoked.`, device: { id: device.id, deviceName: device.device_name, revoked: 1, revokedAt: new Date().toISOString() } });
   }
-
-function processMobileStockEntry(device, input) {
-  if (!input || typeof input !== 'object') {
-    return {
-      success: false,
-      status: 'FAILED',
-      errorCode: 'INVALID_INPUT',
-      message: 'Operation payload must be an object.'
-    };
-  }
-
-  if (input.pharmacyId !== undefined || input.pharmacy_id !== undefined) {
-    return {
-      success: false,
-      status: 'FAILED',
-      errorCode: 'TENANT_SPOOFING_REJECTED',
-      message: 'Client must not supply pharmacy_id. Pharmacy context is determined authoritatively from the authenticated device.'
-    };
-  }
-
-  let medicineId, batchNumber;
-  try {
-    const qrPayloadRaw = input.qrPayload || input.payload || input;
-    const parsed = parseAndValidateQrPayload(qrPayloadRaw);
-    medicineId = parsed.medicineId;
-    batchNumber = parsed.batchNumber;
-  } catch (err) {
-    return {
-      success: false,
-      status: 'FAILED',
-      errorCode: 'INVALID_QR_PAYLOAD',
-      message: err.message
-    };
-  }
-
-  if (input.quantity === undefined || input.quantity === null || input.quantity === '') {
-    return {
-      success: false,
-      status: 'FAILED',
-      errorCode: 'QUANTITY_REQUIRED',
-      message: 'Quantity is required.'
-    };
-  }
-  const quantity = Number(input.quantity);
-  if (!Number.isInteger(quantity) || quantity <= 0) {
-    return {
-      success: false,
-      status: 'FAILED',
-      errorCode: 'INVALID_QUANTITY',
-      message: 'Quantity must be a positive whole number greater than zero.'
-    };
-  }
-  if (quantity > 100000) {
-    return {
-      success: false,
-      status: 'FAILED',
-      errorCode: 'QUANTITY_LIMIT_EXCEEDED',
-      message: 'Quantity exceeds maximum allowable limit of 100,000 units per intake transaction.'
-    };
-  }
-
-  let idempotencyKey = null;
-  try {
-    idempotencyKey = cleanText(input.idempotencyKey || input.idempotency_key, 'Idempotency key', { max: 120 });
-  } catch (err) {
-    return {
-      success: false,
-      status: 'FAILED',
-      errorCode: 'INVALID_IDEMPOTENCY_KEY',
-      message: err.message
-    };
-  }
-  let requestHash = null;
-
-  if (idempotencyKey) {
-    requestHash = crypto.createHash('sha256').update(JSON.stringify({
-      medicineId: Number(medicineId),
-      batchNumber: String(batchNumber).trim(),
-      quantity: Number(quantity)
-    })).digest('hex');
-
-    const existingKey = db.prepare(`
-      SELECT request_hash, response_status, response_body
-      FROM idempotency_keys
-      WHERE key = ? AND pharmacy_id = ?
-    `).get(idempotencyKey, device.pharmacyId);
-
-    if (existingKey) {
-      if (existingKey.request_hash !== requestHash) {
-        return {
-          success: false,
-          status: 'CONFLICT',
-          errorCode: 'IDEMPOTENCY_CONFLICT',
-          message: 'Idempotency key conflict: This idempotency key was previously used with a different request payload.'
-        };
-      }
-      const cachedBody = JSON.parse(existingKey.response_body);
-      cachedBody.idempotent = true;
-      return {
-        success: true,
-        status: 'IDEMPOTENT',
-        idempotent: true,
-        data: cachedBody
-      };
-    }
-  }
-
-  db.exec('BEGIN IMMEDIATE');
-
-  try {
-    const activeDev = db.prepare('SELECT id, revoked FROM paired_devices WHERE id = ? AND revoked = 0').get(device.id);
-    if (!activeDev) {
-      db.exec('ROLLBACK');
-      return {
-        success: false,
-        status: 'FAILED',
-        errorCode: 'DEVICE_REVOKED',
-        message: 'Device has been revoked or is no longer authorized.'
-      };
-    }
-
-    if (idempotencyKey) {
-      const lockedExistingKey = db.prepare(`
-        SELECT request_hash, response_status, response_body
-        FROM idempotency_keys
-        WHERE key = ? AND pharmacy_id = ?
-      `).get(idempotencyKey, device.pharmacyId);
-
-      if (lockedExistingKey) {
-        db.exec('ROLLBACK');
-        if (lockedExistingKey.request_hash !== requestHash) {
-          return {
-            success: false,
-            status: 'CONFLICT',
-            errorCode: 'IDEMPOTENCY_CONFLICT',
-            message: 'Idempotency key conflict: This idempotency key was previously used with a different request payload.'
-          };
-        }
-        const cachedBody = JSON.parse(lockedExistingKey.response_body);
-        cachedBody.idempotent = true;
-        return {
-          success: true,
-          status: 'IDEMPOTENT',
-          idempotent: true,
-          data: cachedBody
-        };
-      }
-    }
-
-    const medicine = db.prepare(`
-      SELECT id, name, generic_name, category
-      FROM medicines
-      WHERE id = ? AND pharmacy_id = ? AND active = 1
-    `).get(medicineId, device.pharmacyId);
-
-    if (!medicine) {
-      db.exec('ROLLBACK');
-      return {
-        success: false,
-        status: 'FAILED',
-        errorCode: 'MEDICINE_NOT_FOUND',
-        message: `Active medicine ID ${medicineId} not found for this pharmacy.`
-      };
-    }
-
-    const batch = db.prepare(`
-      SELECT id, batch_number, quantity, purchase_price, selling_price, expiry_date, location
-      FROM medicine_batches
-      WHERE medicine_id = ? AND batch_number = ?
-    `).get(medicine.id, batchNumber);
-
-    if (!batch) {
-      db.exec('ROLLBACK');
-      return {
-        success: false,
-        status: 'FAILED',
-        errorCode: 'BATCH_NOT_FOUND',
-        message: `Batch '${batchNumber}' not found for medicine '${medicine.name}'.`
-      };
-    }
-
-    db.prepare('UPDATE medicine_batches SET quantity = quantity + ? WHERE id = ?').run(quantity, batch.id);
-
-    const auditUserId = device.pairedBy || db.prepare('SELECT id FROM users WHERE pharmacy_id = ? AND role = "ADMIN" LIMIT 1').get(device.pharmacyId)?.id || 1;
-
-    const movementRes = db.prepare(`
-      INSERT INTO inventory_movements (batch_id, change_quantity, reason, created_by, device_id)
-      VALUES (?, ?, 'RECEIPT', ?, ?)
-    `).run(batch.id, quantity, auditUserId, device.id);
-    const movementId = Number(movementRes.lastInsertRowid);
-
-    const newStock = batch.quantity + quantity;
-
-    const responseData = {
-      success: true,
-      status: 'STOCK_UPDATED',
-      idempotent: false,
-      medicine: {
-        id: medicine.id,
-        name: medicine.name,
-        genericName: medicine.generic_name,
-        category: medicine.category
-      },
-      batch: {
-        id: batch.id,
-        batchNumber: batch.batch_number,
-        quantityAdded: quantity,
-        currentStock: newStock,
-        expiryDate: batch.expiry_date,
-        sellingPrice: batch.selling_price,
-        location: batch.location
-      },
-      movementId,
-      deviceId: device.id,
-      timestamp: new Date().toISOString()
-    };
-
-    if (idempotencyKey) {
-      db.prepare(`
-        INSERT INTO idempotency_keys (key, pharmacy_id, device_id, endpoint, request_hash, response_status, response_body)
-        VALUES (?, ?, ?, '/api/mobile/stock-entry', ?, 200, ?)
-      `).run(idempotencyKey, device.pharmacyId, device.id, requestHash, JSON.stringify(responseData));
-    }
-
-    db.exec('COMMIT');
-
-    refreshExpiryAlerts(device.pharmacyId);
-
-    return {
-      success: true,
-      status: 'SYNCED',
-      idempotent: false,
-      data: responseData
-    };
-  } catch (error) {
-    try { db.exec('ROLLBACK'); } catch {}
-    if (error.message && error.message.includes('UNIQUE constraint failed: idempotency_keys')) {
-      try {
-        const fallbackKey = db.prepare(`
-          SELECT request_hash, response_status, response_body
-          FROM idempotency_keys
-          WHERE key = ? AND pharmacy_id = ?
-        `).get(idempotencyKey, device.pharmacyId);
-        if (fallbackKey) {
-          if (fallbackKey.request_hash !== requestHash) {
-            return {
-              success: false,
-              status: 'CONFLICT',
-              errorCode: 'IDEMPOTENCY_CONFLICT',
-              message: 'Idempotency key conflict: This idempotency key was previously used with a different request payload.'
-            };
-          }
-          const cachedBody = JSON.parse(fallbackKey.response_body);
-          cachedBody.idempotent = true;
-          return {
-            success: true,
-            status: 'IDEMPOTENT',
-            idempotent: true,
-            data: cachedBody
-          };
-        }
-      } catch {}
-    }
-    return {
-      success: false,
-      status: 'FAILED',
-      errorCode: 'OPERATION_ERROR',
-      message: error.message
-    };
-  }
-}
 
   if (req.method === 'POST' && url.pathname === '/api/mobile/stock-entry') {
-    const device = currentDevice(req);
+    const device = await currentDevice(req);
     if (!device) return json(res, 401, { error: 'Device authentication required. Invalid or revoked device token.' });
-
     try {
       const input = await readJson(req);
-      const result = processMobileStockEntry(device, input);
-
-      if (result.success) {
-        return json(res, 200, result.data);
-      }
-
-      if (result.status === 'CONFLICT') {
-        return json(res, 409, { error: result.message });
-      }
-
-      if (result.errorCode === 'MEDICINE_NOT_FOUND' || result.errorCode === 'BATCH_NOT_FOUND') {
-        return json(res, 404, { error: result.message });
-      }
-
+      const result = await processMobileStockEntry(device, input);
+      if (result.success) return json(res, 200, result.data);
+      if (result.status === 'CONFLICT') return json(res, 409, { error: result.message });
+      if (result.errorCode === 'MEDICINE_NOT_FOUND' || result.errorCode === 'BATCH_NOT_FOUND') return json(res, 404, { error: result.message });
       return json(res, 400, { error: result.message });
-    } catch (error) {
-      return json(res, 400, { error: error.message });
-    }
+    } catch (error) { return json(res, 400, { error: error.message }); }
   }
 
   if (req.method === 'POST' && url.pathname === '/api/mobile/stock-entry/batch-sync') {
-    const device = currentDevice(req);
+    const device = await currentDevice(req);
     if (!device) return json(res, 401, { error: 'Device authentication required. Invalid or revoked device token.' });
-
     try {
       const body = await readJson(req);
-
-      if (body.pharmacyId !== undefined || body.pharmacy_id !== undefined) {
-        return json(res, 400, { error: 'Client must not supply pharmacy_id. Pharmacy context is determined authoritatively from the authenticated device.' });
-      }
-
-      if (!body.operations || !Array.isArray(body.operations)) {
-        return json(res, 400, { error: 'Invalid request: "operations" must be a non-empty array.' });
-      }
-
-      if (body.operations.length === 0) {
-        return json(res, 400, { error: 'Operations array must not be empty.' });
-      }
-
-      if (body.operations.length > 100) {
-        return json(res, 400, { error: 'Batch size exceeds maximum allowable limit of 100 operations per request.' });
-      }
+      if (body.pharmacyId !== undefined || body.pharmacy_id !== undefined) return json(res, 400, { error: 'Client must not supply pharmacy_id. Pharmacy context is determined authoritatively from the authenticated device.' });
+      if (!body.operations || !Array.isArray(body.operations)) return json(res, 400, { error: 'Invalid request: "operations" must be a non-empty array.' });
+      if (body.operations.length === 0) return json(res, 400, { error: 'Operations array must not be empty.' });
+      if (body.operations.length > 100) return json(res, 400, { error: 'Batch size exceeds maximum allowable limit of 100 operations per request.' });
 
       const results = [];
-      let syncedCount = 0;
-      let idempotentCount = 0;
-      let failedCount = 0;
+      let syncedCount = 0, idempotentCount = 0, failedCount = 0;
 
       for (let i = 0; i < body.operations.length; i++) {
         const op = body.operations[i];
         const operationId = op && op.operationId ? String(op.operationId).trim() : `op-${i + 1}`;
-        const opResult = processMobileStockEntry(device, op);
-
+        const opResult = await processMobileStockEntry(device, op);
         if (opResult.success) {
           if (opResult.idempotent) {
             idempotentCount++;
-            results.push({
-              operationId,
-              status: 'IDEMPOTENT',
-              idempotent: true,
-              movementId: opResult.data.movementId,
-              batchId: opResult.data.batch ? opResult.data.batch.id : undefined,
-              batchNumber: opResult.data.batch ? opResult.data.batch.batchNumber : undefined,
-              quantityAdded: opResult.data.batch ? opResult.data.batch.quantityAdded : undefined,
-              currentStock: opResult.data.batch ? opResult.data.batch.currentStock : undefined,
-              timestamp: opResult.data.timestamp
-            });
+            results.push({ operationId, status: 'IDEMPOTENT', idempotent: true, movementId: opResult.data.movementId, batchId: opResult.data.batch ? opResult.data.batch.id : undefined, batchNumber: opResult.data.batch ? opResult.data.batch.batchNumber : undefined, quantityAdded: opResult.data.batch ? opResult.data.batch.quantityAdded : undefined, currentStock: opResult.data.batch ? opResult.data.batch.currentStock : undefined, timestamp: opResult.data.timestamp });
           } else {
             syncedCount++;
-            results.push({
-              operationId,
-              status: 'SYNCED',
-              idempotent: false,
-              movementId: opResult.data.movementId,
-              batchId: opResult.data.batch.id,
-              batchNumber: opResult.data.batch.batchNumber,
-              quantityAdded: opResult.data.batch.quantityAdded,
-              currentStock: opResult.data.batch.currentStock,
-              timestamp: opResult.data.timestamp
-            });
+            results.push({ operationId, status: 'SYNCED', idempotent: false, movementId: opResult.data.movementId, batchId: opResult.data.batch.id, batchNumber: opResult.data.batch.batchNumber, quantityAdded: opResult.data.batch.quantityAdded, currentStock: opResult.data.batch.currentStock, timestamp: opResult.data.timestamp });
           }
         } else {
           failedCount++;
-          results.push({
-            operationId,
-            status: opResult.status || 'FAILED',
-            errorCode: opResult.errorCode || 'OPERATION_FAILED',
-            message: opResult.message
-          });
+          results.push({ operationId, status: opResult.status || 'FAILED', errorCode: opResult.errorCode || 'OPERATION_FAILED', message: opResult.message });
         }
       }
 
-      return json(res, 200, {
-        success: true,
-        deviceId: device.id,
-        pharmacyId: device.pharmacyId,
-        summary: {
-          total: body.operations.length,
-          synced: syncedCount,
-          idempotent: idempotentCount,
-          failed: failedCount
-        },
-        results
-      });
-    } catch (error) {
-      return json(res, 400, { error: error.message });
-    }
+      return json(res, 200, { success: true, deviceId: device.id, pharmacyId: device.pharmacyId, summary: { total: body.operations.length, synced: syncedCount, idempotent: idempotentCount, failed: failedCount }, results });
+    } catch (error) { return json(res, 400, { error: error.message }); }
   }
 
   if (url.pathname.startsWith('/api/')) return json(res, 404, { error: 'API endpoint not found.' });
@@ -1413,7 +1144,6 @@ function processMobileStockEntry(device, input) {
 
 const server = http.createServer((req, res) => handler(req, res).catch(error => { console.error(error); json(res, 500, { error: 'Internal server error.' }); }));
 module.exports = { server, handler, passwordHash, passwordMatches, hashDeviceToken, hashSessionToken, currentDevice, currentUser, db, adapter, SESSION_TTL_MS };
-
 
 if (require.main === module) {
   server.listen(PORT, () => console.log(`MediIndex API running on http://localhost:${PORT}`));

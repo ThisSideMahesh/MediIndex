@@ -250,6 +250,19 @@ class PostgreSQLAdapter {
     }
   }
 
+  // prepare(sql) returns a statement-like object with async .get(), .run(), .all().
+  // This makes the PostgreSQL adapter interface compatible with the same call pattern
+  // used for SQLite's DatabaseSync.prepare(), so core.js can call
+  // db.prepare(sql).get(...params) / .run(...params) / .all(...params) uniformly.
+  prepare(sql) {
+    const adapter = this;
+    return {
+      get: (...params) => adapter.get(sql, params),
+      run: (...params) => adapter.run(sql, params),
+      all: (...params) => adapter.query(sql, params),
+    };
+  }
+
   async close() {
     if (this.pool && typeof this.pool.end === 'function') {
       await this.pool.end();

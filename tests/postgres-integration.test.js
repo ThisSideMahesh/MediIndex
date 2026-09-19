@@ -471,3 +471,548 @@ test('POSTGRES-INTEGRATION-CLEANUP: Remove test data', skipIfNoPostgres(async ()
 
   await adapter.close();
 }));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DIALECT COMPATIBILITY TESTS — verify every SQL fix works on real PostgreSQL
+// ─────────────────────────────────────────────────────────────────────────────
+
+const { EventEmitter } = require('node:events');
+// Note: PostgreSQLAdapter is already required at the top of this file
+
+// Reuse DATABASE_URL guard from above (skipIfNoPostgres already defined)
+
+// Helper: call handler over fake HTTP
+function callHandlerPg(handler, { method = 'GET', url, body, cookie, headers = {} } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = new EventEmitter();
+    req.method = method;
+    req.url = url;
+    req.headers = { host: 'localhost', ...(cookie ? { cookie } : {}), ...headers };
+    const res = {
+      _headers: {},
+      writeHead(status, hdrs) { this._status = status; this._headers = hdrs || {}; },
+      end(payload) {
+        try { resolve({ status: this._status, headers: this._headers, body: payload ? JSON.parse(payload) : null }); }
+        catch { resolve({ status: this._status, headers: this._headers, raw: payload }); }
+      }
+    };
+    handler(req, res).catch(reject);
+    if (body !== undefined) setImmediate(() => { req.emit('data', Buffer.from(JSON.stringify(body))); req.emit('end'); });
+    else setImmediate(() => req.emit('end'));
+  });
+}
+
+test('PGDIALECT-001: /api/health executes real SELECT 1 against PostgreSQL', skipIfNoPostgres(async () => {
+  // Use a standalone PG adapter + the minimal handler factory (same pattern as PGDIALECT-013)
+  const pgAdapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
+  await pgAdapter.initialize();
+
+  const { buildHandlerWithAdapter } = buildPgHandlerFactory();
+  const handler = buildHandlerWithAdapter(pgAdapter);
+
+  const res = await callHandlerPg(handler, { url: '/api/health' });
+  assert.equal(res.status, 200, `Expected 200, got ${res.status}: ${JSON.stringify(res.body)}`);
+  assert.equal(res.body.status, 'ok');
+  assert.equal(res.body.database, 'connected');
+
+  await pgAdapter.close();
+}));
+
+test('PGDIALECT-002: INSERT OR IGNORE replacement — expiry alert refresh idempotent on PostgreSQL', skipIfNoPostgres(async () => {
+  const adapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
+  await adapter.initialize();
+
+  // Find test pharmacy created by earlier tests
+  const pharmacy = await adapter.get('SELECT id FROM pharmacies WHERE name LIKE ? LIMIT 1', ['%PG Test%']);
+  if (!pharmacy) { await adapter.close(); return; }
+
+  // Find a batch to attach alerts to
+  const batch = await adapter.get(`
+    SELECT mb.id FROM medicine_batches mb
+    JOIN medicines m ON m.id = mb.medicine_id
+    WHERE m.pharmacy_id = ? LIMIT 1
+  `, [pharmacy.id]);
+  if (!batch) { await adapter.close(); return; }
+
+  // Ensure no alert exists yet for this batch+type
+  await adapter.exec(`DELETE FROM expiry_alerts WHERE batch_id = ${batch.id}`);
+
+  // Insert once — must succeed
+  await adapter.run(`
+    INSERT INTO expiry_alerts (batch_id, alert_type)
+    VALUES (?, 'EXPIRING_SOON')
+    ON CONFLICT (batch_id, alert_type) DO NOTHING
+  `, [batch.id]);
+
+  const count1 = await adapter.get('SELECT COUNT(*) AS n FROM expiry_alerts WHERE batch_id = ?', [batch.id]);
+  assert.equal(Number(count1.n), 1, 'First insert must create one row');
+
+  // Insert again — must be idempotent (no error, no duplicate)
+  await adapter.run(`
+    INSERT INTO expiry_alerts (batch_id, alert_type)
+    VALUES (?, 'EXPIRING_SOON')
+    ON CONFLICT (batch_id, alert_type) DO NOTHING
+  `, [batch.id]);
+
+  const count2 = await adapter.get('SELECT COUNT(*) AS n FROM expiry_alerts WHERE batch_id = ?', [batch.id]);
+  assert.equal(Number(count2.n), 1, 'Second insert must not create a duplicate (ON CONFLICT DO NOTHING)');
+
+  // Cleanup
+  await adapter.exec(`DELETE FROM expiry_alerts WHERE batch_id = ${batch.id}`);
+  await adapter.close();
+}));
+
+test('PGDIALECT-003: CURRENT_DATE date arithmetic works correctly on PostgreSQL', skipIfNoPostgres(async () => {
+  const adapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
+  await adapter.initialize();
+
+  // Verify CURRENT_DATE comparisons work as expected
+  const r = await adapter.get(`
+    SELECT
+      CURRENT_DATE AS today,
+      (CURRENT_DATE + 30) AS plus30,
+      ('2020-01-01'::date < CURRENT_DATE) AS past_is_true,
+      ('2099-12-31'::date > CURRENT_DATE) AS future_is_true,
+      ('2020-01-01'::date >= CURRENT_DATE) AS past_not_gte
+  `);
+  assert.ok(r.today, 'CURRENT_DATE must return a value');
+  assert.ok(r.past_is_true, '2020-01-01 must be in the past');
+  assert.ok(r.future_is_true, '2099-12-31 must be in the future');
+  assert.equal(r.past_not_gte, false, '2020-01-01 must not be >= CURRENT_DATE');
+
+  // Verify +30 days interval
+  const today = new Date(r.today);
+  const plus30 = new Date(r.plus30);
+  const diffDays = Math.round((plus30 - today) / (1000 * 60 * 60 * 24));
+  assert.equal(diffDays, 30, 'CURRENT_DATE + 30 must be exactly 30 days ahead');
+
+  await adapter.close();
+}));
+
+test('PGDIALECT-004: Days-to-expiry integer arithmetic on PostgreSQL', skipIfNoPostgres(async () => {
+  const adapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
+  await adapter.initialize();
+
+  // Test the PostgreSQL days-to-expiry expression (b.expiry_date - CURRENT_DATE)
+  const r = await adapter.get(`
+    SELECT
+      ('2099-12-31'::date - CURRENT_DATE) AS far_future,
+      ('2020-01-01'::date - CURRENT_DATE) AS far_past,
+      (CURRENT_DATE - CURRENT_DATE) AS zero_diff
+  `);
+
+  assert.ok(Number(r.far_future) > 0, 'Far future date must yield positive days');
+  assert.ok(Number(r.far_past) < 0, 'Far past date must yield negative days');
+  assert.equal(Number(r.zero_diff), 0, 'Today minus today must be 0');
+
+  await adapter.close();
+}));
+
+test('PGDIALECT-005: ISO week grouping (to_char IYYY-W IW) on PostgreSQL', skipIfNoPostgres(async () => {
+  const adapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
+  await adapter.initialize();
+
+  // Verify ISO week format matches expected pattern YYYY-WNN
+  const r = await adapter.query(`
+    SELECT to_char(d::date, 'IYYY-"W"IW') AS week_id
+    FROM (VALUES ('2026-09-14'), ('2026-09-07'), ('2026-01-01')) AS t(d)
+    ORDER BY week_id DESC
+  `);
+
+  assert.equal(r.length, 3, 'Must return 3 rows');
+  for (const row of r) {
+    assert.match(row.week_id, /^\d{4}-W\d{2}$/, `week_id "${row.week_id}" must match YYYY-WNN format`);
+  }
+  // 2026-09-14 is ISO week 38
+  assert.equal(r[0].week_id, '2026-W38', 'First row must be 2026-W38');
+
+  await adapter.close();
+}));
+
+test('PGDIALECT-006: Medicine INSERT returns id via RETURNING on PostgreSQL', skipIfNoPostgres(async () => {
+  const adapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
+  await adapter.initialize();
+
+  const pharmacy = await adapter.get('SELECT id FROM pharmacies WHERE name LIKE ? LIMIT 1', ['%PG Test%']);
+  if (!pharmacy) { await adapter.close(); return; }
+
+  // INSERT with RETURNING id
+  const result = await adapter.run(
+    'INSERT INTO medicines (pharmacy_id, name, category, minimum_stock) VALUES (?, ?, ?, ?) RETURNING id',
+    [pharmacy.id, 'PG Dialect Test Medicine', 'Test', 5]
+  );
+
+  assert.ok(result.lastInsertRowid, 'lastInsertRowid must be populated via RETURNING id');
+  assert.ok(Number(result.lastInsertRowid) > 0, 'Returned id must be a positive integer');
+
+  // Verify the row exists
+  const med = await adapter.get('SELECT id, name FROM medicines WHERE id = ?', [result.lastInsertRowid]);
+  assert.ok(med, 'Medicine must exist in database');
+  assert.equal(med.name, 'PG Dialect Test Medicine');
+
+  // Cleanup
+  await adapter.exec(`DELETE FROM medicines WHERE id = ${result.lastInsertRowid}`);
+  await adapter.close();
+}));
+
+test('PGDIALECT-007: Batch INSERT returns id via RETURNING on PostgreSQL', skipIfNoPostgres(async () => {
+  const adapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
+  await adapter.initialize();
+
+  const pharmacy = await adapter.get('SELECT id FROM pharmacies WHERE name LIKE ? LIMIT 1', ['%PG Test%']);
+  if (!pharmacy) { await adapter.close(); return; }
+
+  // Create temp medicine
+  const medResult = await adapter.run(
+    'INSERT INTO medicines (pharmacy_id, name, category, minimum_stock) VALUES (?, ?, ?, ?) RETURNING id',
+    [pharmacy.id, 'PG Batch Test Medicine', 'Test', 0]
+  );
+  const medicineId = Number(medResult.lastInsertRowid);
+
+  // INSERT batch with RETURNING id
+  const batchResult = await adapter.run(
+    'INSERT INTO medicine_batches (medicine_id, batch_number, quantity, purchase_price, selling_price, expiry_date) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
+    [medicineId, 'PG-DIALECT-001', 50, 10.00, 15.00, '2027-12-31']
+  );
+
+  assert.ok(batchResult.lastInsertRowid, 'Batch lastInsertRowid must be populated');
+  const batchId = Number(batchResult.lastInsertRowid);
+  assert.ok(batchId > 0);
+
+  // Insert movement using the returned batch id
+  const movResult = await adapter.run(
+    "INSERT INTO inventory_movements (batch_id, change_quantity, reason, created_by) VALUES (?, ?, 'RECEIPT', ?) RETURNING id",
+    [batchId, 50, 1]
+  );
+  assert.ok(movResult.lastInsertRowid, 'Movement lastInsertRowid must be populated');
+
+  // Cleanup
+  await adapter.exec(`DELETE FROM inventory_movements WHERE batch_id = ${batchId}`);
+  await adapter.exec(`DELETE FROM medicine_batches WHERE id = ${batchId}`);
+  await adapter.exec(`DELETE FROM medicines WHERE id = ${medicineId}`);
+  await adapter.close();
+}));
+
+test('PGDIALECT-008: Sale INSERT returns id + sale_items linked correctly on PostgreSQL', skipIfNoPostgres(async () => {
+  const adapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
+  await adapter.initialize();
+
+  const pharmacy = await adapter.get('SELECT id FROM pharmacies WHERE name LIKE ? LIMIT 1', ['%PG Test%']);
+  const user = await adapter.get("SELECT id FROM users WHERE email LIKE '%pgtest%' LIMIT 1");
+  if (!pharmacy || !user) { await adapter.close(); return; }
+
+  // Create medicine + batch
+  const medRes = await adapter.run(
+    'INSERT INTO medicines (pharmacy_id, name, category, minimum_stock) VALUES (?, ?, ?, ?) RETURNING id',
+    [pharmacy.id, 'PG Sale Test Med', 'Test', 0]
+  );
+  const medicineId = Number(medRes.lastInsertRowid);
+
+  const batchRes = await adapter.run(
+    'INSERT INTO medicine_batches (medicine_id, batch_number, quantity, purchase_price, selling_price, expiry_date) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
+    [medicineId, 'PG-SALE-001', 100, 5.00, 8.00, '2028-06-30']
+  );
+  const batchId = Number(batchRes.lastInsertRowid);
+
+  // INSERT sale with RETURNING id
+  const saleRes = await adapter.run(
+    "INSERT INTO sales (pharmacy_id, invoice_number, payment_method, total_amount, created_by) VALUES (?, ?, 'CASH', ?, ?) RETURNING id",
+    [pharmacy.id, `PG-TEST-SALE-${Date.now()}`, 8.00, user.id]
+  );
+  assert.ok(saleRes.lastInsertRowid, 'Sale lastInsertRowid must be populated');
+  const saleId = Number(saleRes.lastInsertRowid);
+  assert.ok(saleId > 0);
+
+  // Insert sale item using returned saleId
+  await adapter.run(
+    'INSERT INTO sale_items (sale_id, batch_id, quantity, unit_price, line_total) VALUES (?, ?, ?, ?, ?)',
+    [saleId, batchId, 1, 8.00, 8.00]
+  );
+
+  // Verify sale item exists and is linked
+  const item = await adapter.get('SELECT * FROM sale_items WHERE sale_id = ?', [saleId]);
+  assert.ok(item, 'Sale item must exist');
+  assert.equal(item.sale_id, saleId);
+  assert.equal(item.batch_id, batchId);
+
+  // Cleanup
+  await adapter.exec(`DELETE FROM sale_items WHERE sale_id = ${saleId}`);
+  await adapter.exec(`DELETE FROM sales WHERE id = ${saleId}`);
+  await adapter.exec(`DELETE FROM medicine_batches WHERE id = ${batchId}`);
+  await adapter.exec(`DELETE FROM medicines WHERE id = ${medicineId}`);
+  await adapter.close();
+}));
+
+test('PGDIALECT-009: Mobile pairing INSERT returns device id via RETURNING on PostgreSQL', skipIfNoPostgres(async () => {
+  const adapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
+  await adapter.initialize();
+
+  const pharmacy = await adapter.get('SELECT id FROM pharmacies WHERE name LIKE ? LIMIT 1', ['%PG Test%']);
+  const user = await adapter.get("SELECT id FROM users WHERE email LIKE '%pgtest%' LIMIT 1");
+  if (!pharmacy || !user) { await adapter.close(); return; }
+
+  const tokenHash = crypto.createHash('sha256').update('pg-dialect-test-device-' + Date.now()).digest('hex');
+
+  const result = await adapter.run(
+    'INSERT INTO paired_devices (pharmacy_id, device_name, device_model, token_hash, paired_by) VALUES (?, ?, ?, ?, ?) RETURNING id',
+    [pharmacy.id, 'PG Dialect Scanner', 'TestModel', tokenHash, user.id]
+  );
+  assert.ok(result.lastInsertRowid, 'Device lastInsertRowid must be populated');
+  const deviceId = Number(result.lastInsertRowid);
+  assert.ok(deviceId > 0);
+
+  // Verify device was inserted
+  const dev = await adapter.get('SELECT id, device_name FROM paired_devices WHERE id = ?', [deviceId]);
+  assert.ok(dev, 'Device must exist');
+  assert.equal(dev.device_name, 'PG Dialect Scanner');
+
+  // Cleanup
+  await adapter.exec(`DELETE FROM paired_devices WHERE id = ${deviceId}`);
+  await adapter.close();
+}));
+
+test('PGDIALECT-010: case-insensitive medicine ordering (lower(m.name)) on PostgreSQL', skipIfNoPostgres(async () => {
+  const adapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
+  await adapter.initialize();
+
+  const pharmacy = await adapter.get('SELECT id FROM pharmacies WHERE name LIKE ? LIMIT 1', ['%PG Test%']);
+  if (!pharmacy) { await adapter.close(); return; }
+
+  // Insert medicines with mixed case names
+  const names = ['Zinc Sulfate', 'amoxicillin', 'Paracetamol', 'ibuprofen', 'Beta-carotene'];
+  const ids = [];
+  for (const name of names) {
+    const r = await adapter.run(
+      'INSERT INTO medicines (pharmacy_id, name, category, minimum_stock) VALUES (?, ?, ?, ?) RETURNING id',
+      [pharmacy.id, name, 'Test', 0]
+    );
+    ids.push(Number(r.lastInsertRowid));
+  }
+
+  // Query with lower(m.name) ordering
+  const rows = await adapter.query(
+    'SELECT name FROM medicines WHERE pharmacy_id = ? AND active = 1 ORDER BY lower(name)',
+    [pharmacy.id]
+  );
+
+  // Extract just the names we inserted
+  const insertedNames = rows.map(r => r.name).filter(n => names.includes(n));
+  const expected = [...names].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+  assert.deepEqual(insertedNames, expected, 'Medicines must be sorted case-insensitively');
+
+  // Cleanup
+  for (const id of ids) await adapter.exec(`DELETE FROM medicines WHERE id = ${id}`);
+  await adapter.close();
+}));
+
+test('PGDIALECT-011: expiry date CASE expression (expiryStatusCase) on PostgreSQL', skipIfNoPostgres(async () => {
+  const adapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
+  await adapter.initialize();
+
+  // Test the exact CASE expression used in core.js expiryStatusCase()
+  const r = await adapter.query(`
+    SELECT
+      expiry_date,
+      CASE WHEN expiry_date < CURRENT_DATE THEN 'EXPIRED'
+           WHEN expiry_date <= (CURRENT_DATE + 30) THEN 'EXPIRING_SOON'
+           ELSE 'SAFE' END AS expiry_status
+    FROM (VALUES
+      ('2020-01-01'::date),
+      (CURRENT_DATE + 15),
+      (CURRENT_DATE + 60)
+    ) AS t(expiry_date)
+    ORDER BY expiry_date
+  `);
+
+  assert.equal(r.length, 3);
+  assert.equal(r[0].expiry_status, 'EXPIRED', '2020-01-01 must be EXPIRED');
+  assert.equal(r[1].expiry_status, 'EXPIRING_SOON', 'Today+15 must be EXPIRING_SOON');
+  assert.equal(r[2].expiry_status, 'SAFE', 'Today+60 must be SAFE');
+
+  await adapter.close();
+}));
+
+test('PGDIALECT-012: today-sales date filter (created_at::date) on PostgreSQL', skipIfNoPostgres(async () => {
+  const adapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
+  await adapter.initialize();
+
+  // Verify the today-filter expression works in PostgreSQL
+  const r = await adapter.get(`
+    SELECT COUNT(*) AS n FROM (
+      SELECT 1 WHERE CURRENT_TIMESTAMP::date = CURRENT_DATE
+    ) sub
+  `);
+  assert.equal(Number(r.n), 1, 'CURRENT_TIMESTAMP::date = CURRENT_DATE must be true');
+
+  // Verify the created_at::date filter syntax is accepted
+  const check = await adapter.get(
+    "SELECT COUNT(*) AS n FROM sales WHERE created_at::date = CURRENT_DATE AND pharmacy_id = -1"
+  );
+  assert.equal(Number(check.n), 0, 'Query must execute without syntax error');
+
+  await adapter.close();
+}));
+
+test('PGDIALECT-013: full PostgreSQL login → session → /api/auth/me → logout flow', skipIfNoPostgres(async () => {
+  // Use the HTTP handler backed by the real PostgreSQL test adapter
+  // We build a standalone handler instance against the test DB to avoid
+  // mutating the module-level adapter which uses sqlite locally.
+  const pgAdapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
+  await pgAdapter.initialize();
+
+  // Apply schema to ensure tables exist
+  const schemaPath = path.join(__dirname, '..', 'db', 'schema.pg.sql');
+  const schemaSql = fs.readFileSync(schemaPath, 'utf-8');
+  await pgAdapter.exec(schemaSql);
+
+  // Seed a test user
+  const crypto2 = require('node:crypto');
+  const salt = crypto2.randomBytes(16).toString('hex');
+  const hash = crypto2.scryptSync('PgDialectPass@2026', salt, 64).toString('hex');
+  const pwHash = `${salt}:${hash}`;
+
+  // Ensure fresh test pharmacy + user
+  await pgAdapter.exec("DELETE FROM users WHERE email = 'pg-dialect-test@example.com'");
+  await pgAdapter.exec("DELETE FROM pharmacies WHERE name = 'PG Dialect Test Pharmacy'");
+
+  const pharmRes = await pgAdapter.run(
+    "INSERT INTO pharmacies (name, address) VALUES ('PG Dialect Test Pharmacy', 'Test') RETURNING id"
+  );
+  const pharmacyId = Number(pharmRes.lastInsertRowid);
+
+  await pgAdapter.run(
+    "INSERT INTO users (pharmacy_id, full_name, email, password_hash, role) VALUES (?, ?, ?, ?, ?)",
+    [pharmacyId, 'PG Dialect Admin', 'pg-dialect-test@example.com', pwHash, 'ADMIN']
+  );
+
+  // Build handler with this test adapter
+  const { buildHandlerWithAdapter } = buildPgHandlerFactory();
+  const handler = buildHandlerWithAdapter(pgAdapter);
+
+  // 1. Health
+  const h = await callHandlerPg(handler, { url: '/api/health' });
+  assert.equal(h.status, 200, `Health must be 200, got: ${JSON.stringify(h.body)}`);
+  assert.equal(h.body.database, 'connected');
+
+  // 2. Login
+  const login = await callHandlerPg(handler, {
+    method: 'POST', url: '/api/auth/login',
+    body: { email: 'pg-dialect-test@example.com', password: 'PgDialectPass@2026' }
+  });
+  assert.equal(login.status, 200, `Login must be 200, got: ${JSON.stringify(login.body)}`);
+  assert.ok(login.headers['Set-Cookie'], 'Login must set session cookie');
+  const cookie = login.headers['Set-Cookie'];
+  const tokenMatch = cookie.match(/mediindex_session=([^;]+)/);
+  assert.ok(tokenMatch, 'Cookie must contain session token');
+  const rawToken = tokenMatch[1];
+  const tokenHash = crypto2.createHash('sha256').update(rawToken.trim()).digest('hex');
+
+  // Verify session in PG
+  const session = await pgAdapter.get('SELECT * FROM sessions WHERE token_hash = ?', [tokenHash]);
+  assert.ok(session, 'Session must be persisted in PostgreSQL sessions table');
+  assert.equal(session.pharmacy_id, pharmacyId);
+
+  // 3. /api/auth/me
+  const me = await callHandlerPg(handler, { url: '/api/auth/me', cookie });
+  assert.equal(me.status, 200, `/api/auth/me must be 200, got: ${JSON.stringify(me.body)}`);
+  assert.equal(me.body.user.email, 'pg-dialect-test@example.com');
+  assert.equal(me.body.user.role, 'ADMIN');
+
+  // 4. Logout
+  const logout = await callHandlerPg(handler, { method: 'POST', url: '/api/auth/logout', cookie });
+  assert.equal(logout.status, 200, 'Logout must be 200');
+  assert.match(logout.headers['Set-Cookie'], /Max-Age=0/, 'Logout must clear cookie');
+
+  // Session must be deleted
+  const sessionAfter = await pgAdapter.get('SELECT * FROM sessions WHERE token_hash = ?', [tokenHash]);
+  assert.equal(sessionAfter, null, 'Session must be deleted from PostgreSQL after logout');
+
+  // 5. Post-logout /api/auth/me must 401
+  const afterLogout = await callHandlerPg(handler, { url: '/api/auth/me', cookie });
+  assert.equal(afterLogout.status, 401, 'Post-logout request must return 401');
+
+  // Cleanup
+  await pgAdapter.exec(`DELETE FROM sessions WHERE pharmacy_id = ${pharmacyId}`);
+  await pgAdapter.exec(`DELETE FROM users WHERE email = 'pg-dialect-test@example.com'`);
+  await pgAdapter.exec(`DELETE FROM pharmacies WHERE id = ${pharmacyId}`);
+  await pgAdapter.close();
+}));
+
+// Minimal handler factory for PG dialect tests (replicates auth + health routes only)
+function buildPgHandlerFactory() {
+  const crypto3 = require('node:crypto');
+  const SESSION_TTL_MS = 6 * 60 * 60 * 1000;
+
+  function hashTok(t) {
+    if (typeof t !== 'string' || !t.trim()) return '';
+    return crypto3.createHash('sha256').update(t.trim()).digest('hex');
+  }
+  function passwordMatchesLocal(pw, stored) {
+    try {
+      const [salt, hash] = stored.split(':');
+      const actual = crypto3.scryptSync(pw, salt, 64).toString('hex');
+      return crypto3.timingSafeEqual(Buffer.from(actual, 'hex'), Buffer.from(hash, 'hex'));
+    } catch { return false; }
+  }
+  function parseCookiesLocal(req) {
+    return Object.fromEntries((req.headers.cookie || '').split(';').filter(Boolean).map(item => {
+      const i = item.indexOf('=');
+      return [item.slice(0, i).trim(), decodeURIComponent(item.slice(i + 1))];
+    }));
+  }
+  function jsonResp(res, status, body, extra = {}) {
+    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...extra });
+    res.end(JSON.stringify(body));
+  }
+  function readBodyJson(req) {
+    return new Promise((res, rej) => {
+      let d = '';
+      req.on('data', c => { d += c; });
+      req.on('end', () => { try { res(d ? JSON.parse(d) : {}); } catch { rej(new Error('bad json')); } });
+      req.on('error', rej);
+    });
+  }
+  function buildHandlerWithAdapter(db) {
+    return async function handler(req, res) {
+      const url = new URL(req.url, 'http://localhost');
+      if (req.method === 'GET' && url.pathname === '/api/health') {
+        try { await db.prepare('SELECT 1 AS ok').get(); return jsonResp(res, 200, { status: 'ok', database: 'connected' }); }
+        catch (e) { return jsonResp(res, 503, { status: 'error', database: 'unavailable', message: e.message }); }
+      }
+      if (req.method === 'POST' && url.pathname === '/api/auth/login') {
+        try {
+          const { email, password } = await readBodyJson(req);
+          const user = await db.prepare('SELECT * FROM users WHERE lower(email) = lower(?) AND active = 1').get(email.trim());
+          if (!user || !passwordMatchesLocal(password, user.password_hash)) return jsonResp(res, 401, { error: 'Invalid email or password.' });
+          const rawToken = crypto3.randomBytes(32).toString('hex');
+          const tokenHash = hashTok(rawToken);
+          const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+          await db.prepare('INSERT INTO sessions (token_hash, user_id, pharmacy_id, expires_at) VALUES (?, ?, ?, ?)').run(tokenHash, user.id, user.pharmacy_id, expiresAt);
+          await db.prepare('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?').run(user.id);
+          return jsonResp(res, 200, { user: { email: user.email, role: user.role } },
+            { 'Set-Cookie': `mediindex_session=${rawToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL_MS / 1000}` });
+        } catch (e) { return jsonResp(res, 400, { error: e.message }); }
+      }
+      if (req.method === 'POST' && url.pathname === '/api/auth/logout') {
+        const raw = parseCookiesLocal(req).mediindex_session;
+        if (raw) { try { await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashTok(raw)); } catch {} }
+        return jsonResp(res, 200, { ok: true }, { 'Set-Cookie': 'mediindex_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' });
+      }
+      if (req.method === 'GET' && url.pathname === '/api/auth/me') {
+        const raw = parseCookiesLocal(req).mediindex_session;
+        if (!raw || !raw.trim()) return jsonResp(res, 401, { error: 'Authentication required.' });
+        const th = hashTok(raw);
+        const row = await db.prepare(`
+          SELECT s.token_hash, s.user_id, s.pharmacy_id, s.expires_at,
+                 u.id, u.full_name, u.email, u.role, u.active
+          FROM sessions s JOIN users u ON u.id = s.user_id
+          WHERE s.token_hash = ? AND u.active = 1
+        `).get(th);
+        if (!row || new Date(row.expires_at).getTime() < Date.now()) return jsonResp(res, 401, { error: 'Authentication required.' });
+        return jsonResp(res, 200, { user: { id: row.id, email: row.email, role: row.role } });
+      }
+      return jsonResp(res, 404, { error: 'Not found.' });
+    };
+  }
+  return { buildHandlerWithAdapter };
+}

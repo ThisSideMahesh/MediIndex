@@ -193,11 +193,11 @@ class SQLiteAdapter {
     this.db.exec('ROLLBACK');
   }
 
-  transaction(callback, isImmediate = false) {
+  async transaction(callback, isImmediate = false) {
     const startSql = isImmediate ? 'BEGIN IMMEDIATE' : 'BEGIN';
     this.db.exec(startSql);
     try {
-      const result = callback(this);
+      const result = await callback(this);
       this.db.exec('COMMIT');
       return result;
     } catch (err) {
