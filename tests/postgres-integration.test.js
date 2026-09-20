@@ -1017,10 +1017,17 @@ function buildPgHandlerFactory() {
   return { buildHandlerWithAdapter };
 }
 
-test('PGDIALECT-014: GET /api/expiry-alerts — acknowledged filter uses NULL-safe pattern (no CAST error)', skipIfNoPostgres(async () => {
-  // Regression guard for: PostgreSQL raised "invalid input syntax for type integer: ALL"
-  // when acknowledged='ALL' was passed to CAST(? AS INTEGER).
-  // The fix: pass null for 'ALL' and use (? IS NULL OR acknowledged = ?) instead.
+test('PGDIALECT-014: GET /api/expiry-alerts — acknowledged filter uses CAST-typed NULL (no 42P18 error)', skipIfNoPostgres(async () => {
+  // Regression guard for two successive PostgreSQL parameter-type bugs:
+  //
+  // Bug 1 (commit 5a76579): CAST(? AS INTEGER) with string 'ALL' caused:
+  //   "invalid input syntax for type integer: ALL"
+  //   Fix: JS normalises 'ALL' → null before binding.
+  //
+  // Bug 2 (this fix): (? IS NULL OR a.acknowledged=?) with an untyped null caused:
+  //   42P18 "could not determine data type of parameter $4"
+  //   Fix: (CAST(? AS INTEGER) IS NULL OR a.acknowledged=?)
+  //   CAST gives PostgreSQL the type hint it needs; null cast to INTEGER is still null.
 
   const adapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
   await adapter.initialize();
@@ -1056,7 +1063,7 @@ test('PGDIALECT-014: GET /api/expiry-alerts — acknowledged filter uses NULL-sa
       b.id AS batch_id, b.batch_number, b.quantity, b.expiry_date, b.location,
       ${D_DAYS_LEFT_B_PG} AS days_to_expiry
       FROM expiry_alerts a JOIN medicine_batches b ON b.id=a.batch_id JOIN medicines m ON m.id=b.medicine_id
-      WHERE m.pharmacy_id=? AND (?='ALL' OR a.alert_type=?) AND (? IS NULL OR a.acknowledged=?)
+      WHERE m.pharmacy_id=? AND (?='ALL' OR a.alert_type=?) AND (CAST(? AS INTEGER) IS NULL OR a.acknowledged=?)
       ORDER BY a.acknowledged ASC, CASE a.alert_type WHEN 'EXPIRED' THEN 0 ELSE 1 END, b.expiry_date ASC`;
 
   // 1. status=ALL, acknowledged=ALL → acknowledgedParam = null
