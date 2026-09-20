@@ -1179,6 +1179,46 @@ document.querySelector('#forecast-table').addEventListener('click', event => {
   if (medicineId) openForecastDetails(medicineId);
 });
 
+// Store Layout (2D) Listeners
+document.querySelector('#refresh-store-map').addEventListener('click', async () => {
+  await loadStoreMapView();
+});
+
+document.querySelector('#map-medicine-search').addEventListener('input', () => {
+  clearTimeout(window.mapSearchTimer);
+  window.mapSearchTimer = setTimeout(() => {
+    highlightMedicineOnMap(document.querySelector('#map-medicine-search').value);
+  }, 180);
+});
+
+document.querySelector('#map-clear-search-btn').addEventListener('click', () => {
+  document.querySelector('#map-medicine-search').value = '';
+  highlightMedicineOnMap('');
+});
+
+// Shelf node click — select shelf and update inspector
+document.querySelector('.floor-plan-panel').addEventListener('click', event => {
+  const node = event.target.closest('.shelf-node');
+  if (!node) return;
+  const shelfId = node.dataset.shelfId;
+  if (shelfId) selectShelf(shelfId);
+});
+
+// Bill button inside inspector — navigate to POS and pre-fill
+document.querySelector('#inspector-body').addEventListener('click', async event => {
+  const batchId = event.target.dataset.billBatch;
+  const medId = event.target.dataset.medId;
+  if (!batchId || !medId) return;
+  switchView('billing');
+  await loadBillingView();
+  const medSelect = document.querySelector('#pos-medicine-select');
+  medSelect.value = medId;
+  await onMedicineChange();
+  document.querySelector('#pos-batch-select').value = batchId;
+  document.querySelector('#pos-quantity').value = 1;
+  addCartItem();
+});
+
 // QR Specific Listeners
 document.querySelector('#inventory-scan-qr-btn').addEventListener('click', () => openQrScanner('INVENTORY'));
 document.querySelector('#pos-scan-qr-btn').addEventListener('click', () => openQrScanner('POS'));
