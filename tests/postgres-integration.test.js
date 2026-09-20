@@ -1016,3 +1016,86 @@ function buildPgHandlerFactory() {
   }
   return { buildHandlerWithAdapter };
 }
+
+test('PGDIALECT-014: GET /api/expiry-alerts — acknowledged filter uses NULL-safe pattern (no CAST error)', skipIfNoPostgres(async () => {
+  // Regression guard for: PostgreSQL raised "invalid input syntax for type integer: ALL"
+  // when acknowledged='ALL' was passed to CAST(? AS INTEGER).
+  // The fix: pass null for 'ALL' and use (? IS NULL OR acknowledged = ?) instead.
+
+  const adapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
+  await adapter.initialize();
+  const schemaPath = path.join(__dirname, '..', 'db', 'schema.pg.sql');
+  await adapter.exec(fs.readFileSync(schemaPath, 'utf-8'));
+
+  let pharmacy = await adapter.get("SELECT id FROM pharmacies WHERE name LIKE '%PG Test%' LIMIT 1");
+  if (!pharmacy) { await adapter.close(); return; }
+
+  // Create medicine + batch with past expiry (EXPIRED)
+  const medRes = await adapter.run(
+    'INSERT INTO medicines (pharmacy_id, name, category, minimum_stock) VALUES (?, ?, ?, ?) RETURNING id',
+    [pharmacy.id, 'PG Expiry Alert Test Med 14', 'Test', 0]
+  );
+  const medicineId = Number(medRes.lastInsertRowid);
+  const batchRes = await adapter.run(
+    'INSERT INTO medicine_batches (medicine_id, batch_number, quantity, purchase_price, selling_price, expiry_date) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
+    [medicineId, 'PG-EXPIRE-014', 5, 1.00, 2.00, '2020-01-01']
+  );
+  const batchId = Number(batchRes.lastInsertRowid);
+  await adapter.run(
+    "INSERT INTO expiry_alerts (batch_id, alert_type) VALUES (?, 'EXPIRED') ON CONFLICT (batch_id, alert_type) DO NOTHING",
+    [batchId]
+  );
+
+  // --- Core test: verify the fixed SQL pattern executes without error on PostgreSQL ---
+  // This is exactly the SQL that core.js now sends for GET /api/expiry-alerts
+
+  // Simulate the dialect helpers as computed in core.js with isPg=true
+  const D_DAYS_LEFT_B_PG = '(b.expiry_date - CURRENT_DATE)';
+  const alertSql = `SELECT a.id, a.alert_type, a.acknowledged, a.created_at,
+      m.id AS medicine_id, m.name AS medicine_name,
+      b.id AS batch_id, b.batch_number, b.quantity, b.expiry_date, b.location,
+      ${D_DAYS_LEFT_B_PG} AS days_to_expiry
+      FROM expiry_alerts a JOIN medicine_batches b ON b.id=a.batch_id JOIN medicines m ON m.id=b.medicine_id
+      WHERE m.pharmacy_id=? AND (?='ALL' OR a.alert_type=?) AND (? IS NULL OR a.acknowledged=?)
+      ORDER BY a.acknowledged ASC, CASE a.alert_type WHEN 'EXPIRED' THEN 0 ELSE 1 END, b.expiry_date ASC`;
+
+  // 1. status=ALL, acknowledged=ALL → acknowledgedParam = null
+  const r1 = await adapter.query(alertSql, [pharmacy.id, 'ALL', 'ALL', null, null]);
+  assert.ok(Array.isArray(r1), 'status=ALL,acknowledged=ALL must return array without error');
+  const testAlert = r1.find(a => a.batch_id === batchId);
+  assert.ok(testAlert, 'Test alert must appear in ALL/ALL results');
+  assert.equal(testAlert.alert_type, 'EXPIRED');
+  assert.equal(Number(testAlert.acknowledged), 0);
+  // days_to_expiry must be a negative number (batch expired in 2020)
+  const daysLeft = Number(testAlert.days_to_expiry);
+  assert.ok(typeof daysLeft === 'number' && !isNaN(daysLeft), `days_to_expiry must be numeric, got: ${testAlert.days_to_expiry}`);
+  assert.ok(daysLeft < 0, `EXPIRED alert days_to_expiry must be negative, got: ${daysLeft}`);
+
+  // 2. status=EXPIRED, acknowledged=ALL → only EXPIRED alerts
+  const r2 = await adapter.query(alertSql, [pharmacy.id, 'EXPIRED', 'EXPIRED', null, null]);
+  assert.ok(r2.every(a => a.alert_type === 'EXPIRED'), 'status=EXPIRED filter must return only EXPIRED alerts');
+
+  // 3. acknowledged=0 (unacknowledged only) → acknowledgedParam = 0
+  const r3 = await adapter.query(alertSql, [pharmacy.id, 'ALL', 'ALL', 0, 0]);
+  const unackAlert = r3.find(a => a.batch_id === batchId);
+  assert.ok(unackAlert, 'Test alert must appear in acknowledged=0 results');
+  assert.equal(Number(unackAlert.acknowledged), 0);
+
+  // 4. Acknowledge the alert, then filter acknowledged=1
+  await adapter.run('UPDATE expiry_alerts SET acknowledged=1 WHERE id=?', [testAlert.id]);
+  const r4 = await adapter.query(alertSql, [pharmacy.id, 'ALL', 'ALL', 1, 1]);
+  const ackAlert = r4.find(a => a.id === testAlert.id);
+  assert.ok(ackAlert, 'Acknowledged alert must appear in acknowledged=1 filter');
+  assert.equal(Number(ackAlert.acknowledged), 1);
+
+  // 5. acknowledged=0 must NOT return the now-acknowledged alert
+  const r5 = await adapter.query(alertSql, [pharmacy.id, 'ALL', 'ALL', 0, 0]);
+  const shouldBeGone = r5.find(a => a.id === testAlert.id);
+  assert.equal(shouldBeGone, undefined, 'Acknowledged alert must not appear in acknowledged=0 filter');
+
+  // Cleanup
+  await adapter.exec(`DELETE FROM expiry_alerts WHERE batch_id = ${batchId}`);
+  await adapter.exec(`DELETE FROM medicine_batches WHERE id = ${batchId}`);
+  await adapter.exec(`DELETE FROM medicines WHERE id = ${medicineId}`);
+  await adapter.close();
+}));

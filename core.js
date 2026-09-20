@@ -637,11 +637,14 @@ async function handler(req, res) {
     await refreshExpiryAlerts(user.pharmacy_id);
     const status = url.searchParams.get('status') || 'ALL';
     const acknowledged = url.searchParams.get('acknowledged') || 'ALL';
+    // acknowledged filter: pass null to match all rows, or the integer (0/1) to filter.
+    // This avoids CAST(? AS INTEGER) which PostgreSQL evaluates eagerly even inside OR.
+    const acknowledgedParam = acknowledged === 'ALL' ? null : parseInt(acknowledged, 10);
     const alerts = await db.prepare(`SELECT a.id, a.alert_type, a.acknowledged, a.created_at, m.id AS medicine_id, m.name AS medicine_name, b.id AS batch_id, b.batch_number, b.quantity, b.expiry_date, b.location,
       ${D_DAYS_LEFT_B} AS days_to_expiry
       FROM expiry_alerts a JOIN medicine_batches b ON b.id=a.batch_id JOIN medicines m ON m.id=b.medicine_id
-      WHERE m.pharmacy_id=? AND (?='ALL' OR a.alert_type=?) AND (?='ALL' OR a.acknowledged=CAST(? AS INTEGER))
-      ORDER BY a.acknowledged ASC, CASE a.alert_type WHEN 'EXPIRED' THEN 0 ELSE 1 END, b.expiry_date ASC`).all(user.pharmacy_id, status, status, acknowledged, acknowledged);
+      WHERE m.pharmacy_id=? AND (?='ALL' OR a.alert_type=?) AND (? IS NULL OR a.acknowledged=?)
+      ORDER BY a.acknowledged ASC, CASE a.alert_type WHEN 'EXPIRED' THEN 0 ELSE 1 END, b.expiry_date ASC`).all(user.pharmacy_id, status, status, acknowledgedParam, acknowledgedParam);
     return json(res, 200, { alerts });
   }
 
