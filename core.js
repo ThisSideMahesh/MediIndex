@@ -360,7 +360,7 @@ function nonNegative(value, field, { required = false } = {}) {
 }
 
 async function medicineById(id, pharmacyId) {
-  return await db.prepare('SELECT id, name, generic_name, manufacturer, category, minimum_stock, active, created_at, updated_at FROM medicines WHERE id = ? AND pharmacy_id = ?').get(id, pharmacyId);
+  return await db.prepare('SELECT id, pharmacy_id, name, generic_name, manufacturer, category, minimum_stock, active, created_at, updated_at FROM medicines WHERE id = ? AND pharmacy_id = ?').get(id, pharmacyId);
 }
 
 async function serializeMedicine(row) {
@@ -660,7 +660,13 @@ async function handler(req, res) {
   if (req.method === 'GET' && url.pathname === '/api/medicines') {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
     const query = (url.searchParams.get('q') || '').trim();
-    const rows = await db.prepare(`SELECT id, name, generic_name, manufacturer, category, minimum_stock, active, created_at, updated_at FROM medicines WHERE pharmacy_id = ? AND active = 1 AND (name LIKE ? OR generic_name LIKE ?) ORDER BY lower(name)`).all(user.pharmacy_id, `%${query}%`, `%${query}%`);
+    const rows = await db.prepare(`SELECT id, pharmacy_id, name, generic_name, manufacturer, category, minimum_stock, active, created_at, updated_at FROM medicines WHERE pharmacy_id = ? AND active = 1 AND (name LIKE ? OR generic_name LIKE ?) ORDER BY lower(name)`).all(user.pharmacy_id, `%${query}%`, `%${query}%`);
+    return json(res, 200, { medicines: await Promise.all(rows.map(serializeMedicine)) });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/medicines/inactive') {
+    if (!requireRole(res, user, 'ADMIN')) return;
+    const rows = await db.prepare(`SELECT id, pharmacy_id, name, generic_name, manufacturer, category, minimum_stock, active, created_at, updated_at FROM medicines WHERE pharmacy_id = ? AND active = 0 ORDER BY lower(name)`).all(user.pharmacy_id);
     return json(res, 200, { medicines: await Promise.all(rows.map(serializeMedicine)) });
   }
 
@@ -701,6 +707,16 @@ async function handler(req, res) {
     if (!existing || !existing.active) return json(res, 404, { error: 'Medicine not found.' });
     await db.prepare('UPDATE medicines SET active=0, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(existing.id);
     return json(res, 200, { ok: true });
+  }
+
+  const reactivateMatch = url.pathname.match(/^\/api\/medicines\/(\d+)\/reactivate$/);
+  if (reactivateMatch && req.method === 'POST') {
+    if (!requireRole(res, user, 'ADMIN')) return;
+    const target = await db.prepare('SELECT id, name, active, pharmacy_id FROM medicines WHERE id = ? AND pharmacy_id = ?').get(Number(reactivateMatch[1]), user.pharmacy_id);
+    if (!target) return json(res, 404, { error: 'Medicine not found.' });
+    if (target.active) return json(res, 409, { error: 'Medicine is already active.' });
+    await db.prepare('UPDATE medicines SET active=1, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(target.id);
+    return json(res, 200, { medicine: await serializeMedicine(await medicineById(target.id, user.pharmacy_id)) });
   }
 
   const batchListMatch = url.pathname.match(/^\/api\/medicines\/(\d+)\/batches$/);

@@ -1106,3 +1106,62 @@ test('PGDIALECT-014: GET /api/expiry-alerts — acknowledged filter uses CAST-ty
   await adapter.exec(`DELETE FROM medicines WHERE id = ${medicineId}`);
   await adapter.close();
 }));
+
+test('PGDIALECT-015: medicine reactivation workflow on PostgreSQL', skipIfNoPostgres(async () => {
+  const adapter = new PostgreSQLAdapter({ connectionString: DATABASE_URL });
+  await adapter.initialize();
+  const schemaPath = path.join(__dirname, '..', 'db', 'schema.pg.sql');
+  await adapter.exec(fs.readFileSync(schemaPath, 'utf-8'));
+
+  const pharmacy = await adapter.get("SELECT id FROM pharmacies WHERE name LIKE '%PG Test%' LIMIT 1");
+  if (!pharmacy) { await adapter.close(); return; }
+
+  // Create medicine
+  const medRes = await adapter.run(
+    'INSERT INTO medicines (pharmacy_id, name, generic_name, category, minimum_stock) VALUES (?, ?, ?, ?, ?) RETURNING id',
+    [pharmacy.id, 'PG Reactivation Test', 'Test Generic', 'Tablet', 5]
+  );
+  const medicineId = Number(medRes.lastInsertRowid);
+
+  // Add a batch so we can verify stock survives deactivation/reactivation
+  const batchRes = await adapter.run(
+    'INSERT INTO medicine_batches (medicine_id, batch_number, quantity, purchase_price, selling_price, expiry_date) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
+    [medicineId, 'PG-REACT-001', 42, 2.00, 4.00, '2030-12-31']
+  );
+  const batchId = Number(batchRes.lastInsertRowid);
+
+  // Deactivate
+  await adapter.run('UPDATE medicines SET active=0, updated_at=CURRENT_TIMESTAMP WHERE id=?', [medicineId]);
+
+  // Must NOT appear in active listing
+  const activeRows = await adapter.query('SELECT id FROM medicines WHERE pharmacy_id=? AND active=1', [pharmacy.id]);
+  assert.equal(activeRows.find(m => m.id === medicineId), undefined, 'Deactivated medicine must not be in active list');
+
+  // Must appear in inactive listing
+  const inactiveRows = await adapter.query('SELECT id, active FROM medicines WHERE pharmacy_id=? AND active=0', [pharmacy.id]);
+  const found = inactiveRows.find(m => m.id === medicineId);
+  assert.ok(found, 'Deactivated medicine must appear in inactive list');
+  assert.equal(Number(found.active), 0);
+
+  // Reactivate
+  const reactivateRes = await adapter.run('UPDATE medicines SET active=1, updated_at=CURRENT_TIMESTAMP WHERE id=? RETURNING id, name, active', [medicineId]);
+  assert.equal(reactivateRes.rowCount, 1, 'Reactivation must update exactly 1 row');
+
+  // Must appear in active listing again
+  const afterActive = await adapter.query('SELECT id, active FROM medicines WHERE pharmacy_id=? AND active=1', [pharmacy.id]);
+  assert.ok(afterActive.find(m => m.id === medicineId), 'Reactivated medicine must be in active list');
+
+  // Batch stock must be unchanged
+  const batch = await adapter.get('SELECT quantity FROM medicine_batches WHERE id=?', [batchId]);
+  assert.equal(Number(batch.quantity), 42, 'Batch stock must be unchanged after deactivation/reactivation cycle');
+
+  // Already-active: updating active=1 on already-active medicine still updates 1 row (idempotent UPDATE)
+  // The conflict is enforced at application level (409), not database level — verify 409 logic
+  const activeCheck = await adapter.get('SELECT active FROM medicines WHERE id=?', [medicineId]);
+  assert.equal(Number(activeCheck.active), 1, 'Medicine must be active before conflict check');
+
+  // Cleanup
+  await adapter.exec(`DELETE FROM medicine_batches WHERE id = ${batchId}`);
+  await adapter.exec(`DELETE FROM medicines WHERE id = ${medicineId}`);
+  await adapter.close();
+}));

@@ -119,6 +119,43 @@ async function loadMedicines() {
   } catch (error) {
     document.querySelector('#inventory-error').textContent = error.message;
   }
+  // Show/hide inactive toggle for admins
+  const toggleRow = document.querySelector('#inactive-toggle-row');
+  if (toggleRow) toggleRow.style.display = currentUser && currentUser.role === 'ADMIN' ? 'block' : 'none';
+}
+
+function inactiveMedicineCard(medicine) {
+  return `
+    <article class="medicine-card inactive-medicine-card">
+      <div class="medicine-main">
+        <div>
+          <h3>${escapeHtml(medicine.name)} <span class="badge warning" style="font-size:0.65rem;vertical-align:middle">INACTIVE</span></h3>
+          <p>${escapeHtml(medicine.generic_name || 'No generic name')} · ${escapeHtml(medicine.manufacturer || 'Manufacturer not specified')}</p>
+        </div>
+        <span class="stock">${medicine.total_stock} units on-hand</span>
+      </div>
+      <div class="medicine-meta">
+        <span>${escapeHtml(medicine.category || 'Uncategorised')}</span>
+        <span>Minimum: ${medicine.minimum_stock}</span>
+        <span class="muted">Deactivated</span>
+      </div>
+      <div class="card-actions">
+        <button class="secondary" data-reactivate="${medicine.id}">Reactivate</button>
+      </div>
+    </article>
+  `;
+}
+
+async function loadInactiveMedicines() {
+  const container = document.querySelector('#inactive-medicine-list');
+  try {
+    const response = await api('/api/medicines/inactive');
+    container.innerHTML = response.medicines.length
+      ? response.medicines.map(inactiveMedicineCard).join('')
+      : '<section class="panel empty"><h3>No inactive medicines</h3><p>Deactivated medicines will appear here.</p></section>';
+  } catch (error) {
+    document.querySelector('#inventory-error').textContent = error.message;
+  }
 }
 
 async function toggleBatches(id) {
@@ -986,6 +1023,33 @@ document.querySelectorAll('.nav').forEach(button => {
 document.querySelector('#medicine-search').addEventListener('input', () => {
   clearTimeout(window.searchTimer);
   window.searchTimer = setTimeout(loadMedicines, 180);
+});
+
+document.querySelector('#toggle-inactive-btn').addEventListener('click', async () => {
+  const section = document.querySelector('#inactive-medicines-section');
+  const btn = document.querySelector('#toggle-inactive-btn');
+  if (!section.hidden) {
+    section.hidden = true;
+    btn.textContent = 'Show inactive medicines';
+  } else {
+    await loadInactiveMedicines();
+    section.hidden = false;
+    btn.textContent = 'Hide inactive medicines';
+  }
+});
+
+document.querySelector('#inactive-medicine-list').addEventListener('click', async event => {
+  const id = Number(event.target.dataset.reactivate);
+  if (!id) return;
+  if (!confirm('Reactivate this medicine? It will be restored to the active catalogue.')) return;
+  try {
+    await api(`/api/medicines/${id}/reactivate`, { method: 'POST' });
+    await loadMedicines();
+    await loadInactiveMedicines();
+    await refreshDashboard();
+  } catch (error) {
+    document.querySelector('#inventory-error').textContent = error.message;
+  }
 });
 
 document.querySelector('#add-medicine').addEventListener('click', () => {

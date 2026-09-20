@@ -16,6 +16,12 @@
         <div class="section-heading"><div><p class="eyebrow">CATALOGUE AND BATCH STOCK</p><h2>Medicines &amp; inventory</h2></div><button id="add-medicine">Add medicine</button></div>
         <div class="search-row"><input id="medicine-search" type="search" placeholder="Search medicine or generic name"><button id="inventory-scan-qr-btn" class="secondary" type="button">Scan QR</button><span id="medicine-count" class="muted"></span></div>
         <p id="inventory-error" class="error" role="alert"></p><div id="medicine-list" class="medicine-list"></div>
+        <div id="inactive-medicines-section" hidden>
+          <div class="section-heading" style="margin-top:2rem"><div><p class="eyebrow">ADMIN ONLY</p><h3>Inactive medicines</h3></div></div>
+          <p class="muted" style="margin-bottom:0.75rem">These medicines have been deactivated. Existing batch stock and sales history are preserved. Reactivating restores them to the active catalogue.</p>
+          <div id="inactive-medicine-list" class="medicine-list"></div>
+        </div>
+        <div id="inactive-toggle-row" style="margin-top:1.5rem;display:none"><button id="toggle-inactive-btn" class="secondary">Show inactive medicines</button></div>
       </section>
       <section id="billing-view" hidden>
         <div class="section-heading"><div><p class="eyebrow">POINT OF SALE &amp; DISPENSING</p><h2>Billing &amp; POS</h2></div><button id="pos-scan-qr-btn" class="secondary" type="button">Scan QR to Bill</button></div>
