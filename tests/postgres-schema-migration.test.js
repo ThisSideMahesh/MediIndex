@@ -57,6 +57,20 @@ function preFeatureSchema() {
   return full.slice(0, full.lastIndexOf('-- ====', idx));
 }
 
+/**
+ * Returns schema.pg.sql truncated to exclude the MANUAL MEDICINE REQUESTS block,
+ * i.e. a database that already has the near-expiry feature but not the manual
+ * medicine-request tables — the exact state of the deployed Neon database before
+ * this migration is applied.
+ */
+function preManualRequestSchema() {
+  const full = fs.readFileSync(path.join(__dirname, '..', 'db', 'schema.pg.sql'), 'utf-8');
+  const marker = '-- MANUAL MEDICINE REQUESTS — PROGRESSIVE GEOGRAPHIC SEARCH (additive migration)';
+  const idx = full.indexOf(marker);
+  if (idx < 0) return full;
+  return full.slice(0, full.lastIndexOf('-- ====', idx));
+}
+
 async function withThrowawayDb(callback) {
   const { Client } = require('pg');
   const admin = new Client({ connectionString: adminUrl() });
@@ -332,7 +346,239 @@ test('PGMIG-007: concurrent cold starts all succeed with no 23505/42P07 and a co
     });
   }));
 
-test('PGMIG-008: endpoint remains tenant-scoped on PostgreSQL after auto-migration',
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 1 — MANUAL MEDICINE REQUEST SCHEMA
+// Verifies the additive migration for pharmacies.active, medicine_requests and
+// medicine_request_offers applies correctly to a database that already has the
+// near-expiry feature but not these tables (the deployed Neon state), preserves
+// existing data, is idempotent, and enforces every approved constraint.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Seeds a database that has the near-expiry feature but NOT the manual-request tables. */
+async function seedPreManualRequestDb() {
+  const { Client } = require('pg');
+  const c = new Client({ connectionString: throwawayUrl() });
+  await c.connect();
+  await c.query(preManualRequestSchema());
+  await c.query("INSERT INTO pharmacies (name, address, latitude, longitude) VALUES ('Live A', 'Addr A', 19.0760, 72.8777)");
+  await c.query("INSERT INTO pharmacies (name, address) VALUES ('Live B (no coords)', 'Addr B')");
+  await c.query("INSERT INTO users (pharmacy_id, full_name, email, password_hash, role) VALUES (1, 'Real Admin', 'p1admin@mediindex.local', 'salt:hash', 'ADMIN')");
+  await c.query("INSERT INTO medicines (pharmacy_id, name, minimum_stock) VALUES (1, 'Paracetamol', 25)");
+  await c.query("INSERT INTO medicine_batches (medicine_id, batch_number, quantity, selling_price, expiry_date) VALUES (1, 'LIVE-LOT-1', 137, 4.50, '2030-06-30')");
+  const counts = {};
+  for (const t of ['pharmacies', 'users', 'medicines', 'medicine_batches']) {
+    counts[t] = (await c.query(`SELECT COUNT(*)::int AS n FROM ${t}`)).rows[0].n;
+  }
+  const hasActive = (await c.query(
+    "SELECT 1 FROM information_schema.columns WHERE table_name='pharmacies' AND column_name='active'")).rowCount > 0;
+  const hasTables = (await c.query(
+    "SELECT table_name FROM information_schema.tables WHERE table_name IN ('medicine_requests','medicine_request_offers')")).rows.length;
+  await c.end();
+  return { counts, hasActive, hasTables };
+}
+
+test('PGMIG-009: manual-request migration applies to an existing near-expiry database, preserving data',
+  skipIfNoPg(async () => {
+    await withThrowawayDb(async () => {
+      const { counts, hasActive, hasTables } = await seedPreManualRequestDb();
+      assert.equal(hasActive, false, 'Precondition: pharmacies.active must be absent');
+      assert.equal(hasTables, 0, 'Precondition: manual-request tables must be absent');
+
+      const { PostgreSQLAdapter } = require('../db/postgres-adapter');
+      const ad = new PostgreSQLAdapter({ connectionString: throwawayUrl() });
+      ad.initialize();
+      try {
+        // Apply TWICE — must be idempotent
+        await ad.ensureSchema();
+        ad._schemaReady = null;            // force a genuine second application
+        await ad.ensureSchema();
+
+        // New column present, and every existing pharmacy became active
+        const col = await ad.get(
+          "SELECT column_name, is_nullable, column_default FROM information_schema.columns WHERE table_name='pharmacies' AND column_name='active'");
+        assert.ok(col, 'pharmacies.active must exist');
+        assert.equal(col.is_nullable, 'NO', 'active must be NOT NULL');
+        assert.match(String(col.column_default), /1/, 'active must default to 1');
+        const inactive = await ad.query('SELECT id FROM pharmacies WHERE active <> 1');
+        assert.equal(inactive.length, 0, 'all pre-existing pharmacies must be active');
+
+        // New tables present
+        for (const t of ['medicine_requests', 'medicine_request_offers']) {
+          const row = await ad.get(
+            'SELECT table_name FROM information_schema.tables WHERE table_name = ?', [t]);
+          assert.ok(row, `${t} must exist`);
+        }
+
+        // Indexes present
+        const idx = await ad.query(
+          "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND indexname LIKE 'idx_mreq%'");
+        assert.equal(idx.length, 5, `expected 5 idx_mreq* indexes, found ${idx.length}`);
+
+        // Existing data fully preserved
+        for (const [t, n] of Object.entries(counts)) {
+          const row = await ad.get(`SELECT COUNT(*)::int AS n FROM ${t}`);
+          assert.equal(row.n, n, `${t} row count must be unchanged (${n})`);
+        }
+        const batch = await ad.get('SELECT quantity, selling_price, batch_number FROM medicine_batches WHERE id = 1');
+        assert.equal(batch.quantity, 137, 'batch quantity must be unchanged');
+        assert.equal(batch.batch_number, 'LIVE-LOT-1', 'batch number must be unchanged');
+        const phB = await ad.get('SELECT latitude, longitude FROM pharmacies WHERE id = 2');
+        assert.equal(phB.latitude, null, 'pharmacy with NULL coordinates must remain valid');
+
+        // The automatic near-expiry table must remain present and separate
+        const redis = await ad.get(
+          "SELECT table_name FROM information_schema.tables WHERE table_name = 'medicine_redistribution_requests'");
+        assert.ok(redis, 'near-expiry redistribution table must still exist, untouched');
+      } finally {
+        await ad.close();
+      }
+    });
+  }));
+
+test('PGMIG-010: manual-request schema enforces every approved constraint on PostgreSQL',
+  skipIfNoPg(async () => {
+    await withThrowawayDb(async () => {
+      await seedPreManualRequestDb();
+      const { PostgreSQLAdapter } = require('../db/postgres-adapter');
+      const ad = new PostgreSQLAdapter({ connectionString: throwawayUrl() });
+      ad.initialize();
+      try {
+        await ad.ensureSchema();
+
+        const mustFail = async (label, sql, params = []) => {
+          let threw = false;
+          try { await ad.run(sql, params); } catch { threw = true; }
+          assert.equal(threw, true, `${label} must be rejected by the database`);
+        };
+
+        // Baseline valid request
+        await ad.run(
+          `INSERT INTO medicine_requests (idempotency_key, requester_pharmacy_id, medicine_id,
+             medicine_name, requested_quantity, current_radius_km, created_by, expires_at)
+           VALUES ('pg-k1', 1, 1, 'Paracetamol', 50, 10, 1, CURRENT_TIMESTAMP + INTERVAL '72 hours')`);
+
+        await mustFail('requested_quantity > 0',
+          `INSERT INTO medicine_requests (idempotency_key, requester_pharmacy_id, medicine_id,
+             medicine_name, requested_quantity, current_radius_km, created_by, expires_at)
+           VALUES ('pg-k2', 1, 1, 'X', 0, 10, 1, CURRENT_TIMESTAMP)`);
+        await mustFail('idempotency_key UNIQUE',
+          `INSERT INTO medicine_requests (idempotency_key, requester_pharmacy_id, medicine_id,
+             medicine_name, requested_quantity, current_radius_km, created_by, expires_at)
+           VALUES ('pg-k1', 1, 1, 'X', 5, 10, 1, CURRENT_TIMESTAMP)`);
+        await mustFail('ck_mreq_coverage (covered_quantity <= requested_quantity)',
+          'UPDATE medicine_requests SET covered_quantity = 51 WHERE id = 1');
+        await mustFail('invalid request status',
+          "UPDATE medicine_requests SET status = 'BOGUS' WHERE id = 1");
+        await mustFail('invalid priority',
+          "UPDATE medicine_requests SET priority = 'BOGUS' WHERE id = 1");
+
+        // All six approved request statuses must be accepted
+        for (const s of ['OPEN', 'PARTIALLY_COVERED', 'FULLY_COVERED', 'NO_COVERAGE', 'CANCELLED', 'EXPIRED']) {
+          await ad.run('UPDATE medicine_requests SET status = ? WHERE id = 1', [s]);
+        }
+        await ad.run("UPDATE medicine_requests SET status = 'OPEN' WHERE id = 1");
+
+        // Zero usable stock must be storable (decision 12: zero-stock pharmacies are contactable)
+        await ad.run(
+          `INSERT INTO medicine_request_offers (request_id, pharmacy_id, zone_index, distance_km,
+             usable_stock_at_contact, respond_by)
+           VALUES (1, 2, 0, 8.4, 0, CURRENT_TIMESTAMP + INTERVAL '24 hours')`);
+        const zero = await ad.get('SELECT usable_stock_at_contact FROM medicine_request_offers WHERE request_id = 1 AND pharmacy_id = 2');
+        assert.equal(Number(zero.usable_stock_at_contact), 0, 'zero usable stock must be allowed');
+
+        await mustFail('uq_mreq_offer UNIQUE(request_id, pharmacy_id)',
+          `INSERT INTO medicine_request_offers (request_id, pharmacy_id, zone_index, distance_km,
+             usable_stock_at_contact, respond_by)
+           VALUES (1, 2, 1, 9.9, 5, CURRENT_TIMESTAMP)`);
+        await mustFail('ck_mreq_offer_accepted_qty (ACCEPTED requires offered_quantity)',
+          "UPDATE medicine_request_offers SET status = 'ACCEPTED' WHERE request_id = 1 AND pharmacy_id = 2");
+        await mustFail('offered_quantity > 0',
+          'UPDATE medicine_request_offers SET offered_quantity = 0 WHERE request_id = 1 AND pharmacy_id = 2');
+        await mustFail('invalid offer status (CANCELLED is not an offer state)',
+          "UPDATE medicine_request_offers SET status = 'CANCELLED' WHERE request_id = 1 AND pharmacy_id = 2");
+
+        // All five approved offer statuses must be accepted
+        for (const s of ['PENDING', 'DECLINED', 'SUPERSEDED', 'EXPIRED']) {
+          await ad.run('UPDATE medicine_request_offers SET status = ? WHERE request_id = 1 AND pharmacy_id = 2', [s]);
+        }
+        await ad.run("UPDATE medicine_request_offers SET offered_quantity = 20, status = 'ACCEPTED' WHERE request_id = 1 AND pharmacy_id = 2");
+        const acc = await ad.get('SELECT status, offered_quantity FROM medicine_request_offers WHERE request_id = 1 AND pharmacy_id = 2');
+        assert.equal(acc.status, 'ACCEPTED');
+        assert.equal(Number(acc.offered_quantity), 20);
+      } finally {
+        await ad.close();
+      }
+    });
+  }));
+
+test('PGMIG-011: manual-request migration is safe under concurrent cold starts',
+  skipIfNoPg(async () => {
+    await withThrowawayDb(async () => {
+      await seedPreManualRequestDb();
+      const { PostgreSQLAdapter } = require('../db/postgres-adapter');
+      const adapters = Array.from({ length: 6 }, () => {
+        const a = new PostgreSQLAdapter({ connectionString: throwawayUrl() });
+        a.initialize();
+        return a;
+      });
+      try {
+        const results = await Promise.allSettled(adapters.map(a => a.ensureSchema()));
+        const rejected = results.filter(r => r.status === 'rejected');
+        const raceCodes = rejected.filter(r => r.reason && ['23505', '42P07'].includes(r.reason.code));
+        assert.equal(raceCodes.length, 0,
+          'no initializer may fail with 23505/42P07: ' + raceCodes.map(r => r.reason.code).join(','));
+        assert.equal(rejected.length, 0,
+          'all concurrent initializers must succeed: ' + rejected.map(r => r.reason && r.reason.message).join(' | '));
+
+        const probe = adapters[0];
+        const dupes = await probe.query(
+          "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() GROUP BY table_name HAVING COUNT(*) > 1");
+        assert.equal(dupes.length, 0, 'no duplicate table definitions');
+        for (const t of ['medicine_requests', 'medicine_request_offers']) {
+          assert.ok(await probe.get('SELECT table_name FROM information_schema.tables WHERE table_name = ?', [t]),
+            `${t} must exist after concurrent init`);
+        }
+        const idx = await probe.query(
+          "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND indexname LIKE 'idx_mreq%'");
+        assert.equal(idx.length, 5, 'all 5 manual-request indexes must exist');
+        const held = await probe.get("SELECT COUNT(*)::int AS n FROM pg_locks WHERE locktype = 'advisory'");
+        assert.equal(Number(held.n), 0, 'advisory lock must be released');
+      } finally {
+        await Promise.all(adapters.map(a => a.close().catch(() => {})));
+      }
+    });
+  }));
+
+test('PGMIG-012: manual-request tables never carry inventory-mutating structures',
+  skipIfNoPg(async () => {
+    await withThrowawayDb(async () => {
+      await seedPreManualRequestDb();
+      const { PostgreSQLAdapter } = require('../db/postgres-adapter');
+      const ad = new PostgreSQLAdapter({ connectionString: throwawayUrl() });
+      ad.initialize();
+      try {
+        await ad.ensureSchema();
+        // No trigger may exist on the new tables that could mutate inventory.
+        const triggers = await ad.query(
+          `SELECT trigger_name FROM information_schema.triggers
+           WHERE event_object_table IN ('medicine_requests','medicine_request_offers')`);
+        assert.equal(triggers.length, 0,
+          'manual-request tables must have no triggers (no implicit inventory movement)');
+
+        // Applying the schema must not have altered any batch quantity.
+        const batch = await ad.get('SELECT quantity FROM medicine_batches WHERE id = 1');
+        assert.equal(Number(batch.quantity), 137, 'schema application must not touch inventory');
+
+        // inventory_movements must be untouched by the migration.
+        const mv = await ad.get('SELECT COUNT(*)::int AS n FROM inventory_movements');
+        assert.equal(Number(mv.n), 0, 'migration must not create inventory movements');
+      } finally {
+        await ad.close();
+      }
+    });
+  }));
+
+test('PGMIG-013: endpoint remains tenant-scoped on PostgreSQL after auto-migration',
   skipIfNoPg(async () => {
     await withThrowawayDb(async () => {
       const { rawToken } = await seedPreFeatureDb();
