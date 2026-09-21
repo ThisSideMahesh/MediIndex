@@ -9,7 +9,7 @@
     </section>
     <section id="app-view" hidden>
       <header><div class="brand-row"><img class="header-logo" src="/assets/mediindex-logo.png" alt="MediIndex"><div><p class="eyebrow">OFFLINE-READY LOCAL SYSTEM</p><h1>MediIndex <span>Dashboard</span></h1></div></div><div class="user"><span id="user-name"></span><div id="sync-status" class="sync-status" title="Synchronization status" hidden><span id="sync-icon" class="sync-icon">●</span><span id="sync-label">Online</span><span id="sync-pending" class="sync-pending" hidden></span></div><button id="logout" class="secondary">Logout</button></div></header>
-      <nav aria-label="Main navigation"><button class="nav active" data-view="dashboard">Dashboard</button><button class="nav" data-view="inventory">Medicines &amp; inventory</button><button class="nav" data-view="billing">Billing &amp; POS</button><button class="nav" data-view="analytics">Demand Forecasting</button><button class="nav" data-view="store-map">Store Layout (2D)</button><button class="nav" data-view="expiry">Expiry alerts</button><button class="nav admin-only-nav" data-view="redistribution" hidden>Near-Expiry Redistribution</button></nav>
+      <nav aria-label="Main navigation"><button class="nav active" data-view="dashboard">Dashboard</button><button class="nav" data-view="inventory">Medicines &amp; inventory</button><button class="nav" data-view="billing">Billing &amp; POS</button><button class="nav" data-view="analytics">Demand Forecasting</button><button class="nav" data-view="store-map">Store Layout (2D)</button><button class="nav" data-view="expiry">Expiry alerts</button><button class="nav admin-only-nav" data-view="redistribution" hidden>Near-Expiry Redistribution</button><button class="nav" data-view="medicine-requests">Medicine Requests<span id="medicine-requests-badge" class="nav-badge" hidden>0</span></button></nav>
       <p class="demo-note">DEMO / SYNTHETIC DATA - values are calculated from the local SQLite database.</p>
       <section id="dashboard-view"><div class="grid" id="metrics"></div><section class="panel"><h2>Foundation status</h2><ul><li><strong>Database:</strong> SQLite is connected and persisted locally.</li><li><strong>Authentication:</strong> password hashes, expiring server sessions and protected API routes are active.</li><li><strong>Inventory &amp; Billing:</strong> catalogue management, multi-batch stock, and transactional FEFO billing are active.</li><li><strong>Forecasting Engine:</strong> 3-period Weighted Moving Average (WMA) with hard reliability guardrails.</li><li><strong>Store Layout:</strong> 2D interactive floor plan visualizer for rapid medicine localization.</li></ul></section></section>
       <section id="inventory-view" hidden>
@@ -419,8 +419,107 @@
           </table>
         </div>
       </section>
+
+      <!-- ── MANUAL MEDICINE REQUESTS (progressive geographic search) ───────
+           A separate workflow from the automatic Near-Expiry Redistribution
+           above. Available to STAFF and ADMIN alike. -->
+      <section id="medicine-requests-view" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">INTER-PHARMACY · MANUAL MEDICINE REQUESTS</p>
+            <h2>Medicine Requests</h2>
+          </div>
+          <div class="mreq-heading-actions">
+            <button id="mreq-refresh-btn" class="secondary">Refresh</button>
+            <button id="mreq-new-btn">New Request</button>
+          </div>
+        </div>
+        <p class="muted" style="margin-bottom:1rem">
+          Request a specific medicine and quantity from nearby pharmacies. The server searches
+          progressively outward, contacting the nearest pharmacies that can help before widening the
+          radius. <strong>Offers are commitments only &mdash; no inventory is transferred.</strong>
+          Proximity requires pharmacy coordinates.
+        </p>
+
+        <div class="mreq-tabs" role="tablist" aria-label="Medicine request views">
+          <button class="mreq-tab active" role="tab" aria-selected="true" data-mreq-tab="mine">My Requests</button>
+          <button class="mreq-tab" role="tab" aria-selected="false" data-mreq-tab="incoming">
+            Incoming Requests<span id="mreq-incoming-count" class="nav-badge" hidden>0</span>
+          </button>
+        </div>
+
+        <p id="mreq-error" class="error" role="alert"></p>
+        <p id="mreq-offline-note" class="hint" hidden>
+          You appear to be offline. Medicine requests need a live connection because stock and
+          proximity are calculated on the server. They are not queued for later sync.
+        </p>
+
+        <!-- My Requests -->
+        <div id="mreq-mine-panel">
+          <div class="filter-row">
+            <label>Status
+              <select id="mreq-status-filter">
+                <option value="ALL">All statuses</option>
+                <option value="OPEN">Open</option>
+                <option value="PARTIALLY_COVERED">Partially covered</option>
+                <option value="FULLY_COVERED">Fully covered</option>
+                <option value="NO_COVERAGE">No coverage</option>
+                <option value="CANCELLED">Cancelled</option>
+                <option value="EXPIRED">Expired</option>
+              </select>
+            </label>
+            <label>Medicine<input id="mreq-medicine-filter" maxlength="150" placeholder="Exact name (optional)"></label>
+          </div>
+          <div id="mreq-mine-list" class="mreq-list" aria-live="polite">
+            <p class="empty">Loading your medicine requests…</p>
+          </div>
+        </div>
+
+        <!-- Incoming Requests -->
+        <div id="mreq-incoming-panel" hidden>
+          <div id="mreq-incoming-list" class="mreq-list" aria-live="polite">
+            <p class="empty">Loading incoming medicine requests…</p>
+          </div>
+        </div>
+      </section>
     </section>
   </main>
+  <dialog id="mreq-create-dialog">
+    <form id="mreq-create-form" method="dialog">
+      <div class="dialog-head"><h2>New medicine request</h2><button class="icon" type="button" data-close="mreq-create-dialog" aria-label="Close">×</button></div>
+      <p class="muted font-xs" style="margin-top:0">Nearby pharmacies will be asked to commit stock. Nothing is transferred automatically.</p>
+      <label>Medicine name
+        <input id="mreq-create-medicine" required maxlength="150" list="mreq-medicine-options" placeholder="Example: Paracetamol">
+      </label>
+      <datalist id="mreq-medicine-options"></datalist>
+      <div class="two-col">
+        <label>Quantity needed<input id="mreq-create-quantity" type="number" min="1" step="1" required placeholder="50"></label>
+        <label>Priority
+          <select id="mreq-create-priority">
+            <option value="NORMAL">Normal</option>
+            <option value="URGENT">Urgent</option>
+          </select>
+        </label>
+      </div>
+      <label>Reason (optional)<input id="mreq-create-reason" maxlength="200" placeholder="Example: Stock shortage"></label>
+      <p class="error" id="mreq-create-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button class="secondary" type="button" data-close="mreq-create-dialog">Cancel</button>
+        <button type="submit" id="mreq-create-submit">Create request</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="mreq-detail-dialog">
+    <div class="dialog-head">
+      <h2 id="mreq-detail-title">Medicine request</h2>
+      <button class="icon" type="button" data-close="mreq-detail-dialog" aria-label="Close">×</button>
+    </div>
+    <div id="mreq-detail-body"></div>
+    <p class="error" id="mreq-detail-error" role="alert"></p>
+    <div class="dialog-actions" id="mreq-detail-actions"></div>
+  </dialog>
+
   <dialog id="medicine-dialog"><form id="medicine-form" method="dialog"><div class="dialog-head"><h2 id="medicine-form-title">Add medicine</h2><button class="icon" type="button" data-close="medicine-dialog" aria-label="Close">×</button></div><input id="medicine-id" type="hidden"><label>Medicine name<input id="medicine-name" required maxlength="150"></label><label>Generic name<input id="medicine-generic" maxlength="150"></label><label>Manufacturer<input id="medicine-manufacturer" maxlength="150"></label><label>Category<input id="medicine-category" maxlength="150"></label><label>Minimum stock<input id="medicine-minimum" type="number" min="0" value="0" required></label><p class="error" id="medicine-form-error" role="alert"></p><div class="dialog-actions"><button class="secondary" type="button" data-close="medicine-dialog">Cancel</button><button type="submit">Save medicine</button></div></form></dialog>
   <dialog id="batch-dialog"><form id="batch-form" method="dialog"><div class="dialog-head"><h2>Add batch stock</h2><button class="icon" type="button" data-close="batch-dialog" aria-label="Close">×</button></div><p id="batch-medicine-label" class="muted"></p><input id="batch-medicine-id" type="hidden"><label>Batch number<input id="batch-number" required maxlength="80"></label><div class="two-col"><label>Quantity<input id="batch-quantity" type="number" min="0" required></label><label>Selling price (INR)<input id="batch-selling" type="number" min="0" step="0.01" required></label></div><div class="two-col"><label>Purchase price (INR)<input id="batch-purchase" type="number" min="0" step="0.01" value="0"></label><label>Expiry date<input id="batch-expiry" type="date" required></label></div><label>Manufacturing date<input id="batch-manufacturing" type="date"></label><label>Shelf/location<input id="batch-location" maxlength="100" placeholder="Example: Rack B, Shelf 2"></label><p class="error" id="batch-form-error" role="alert"></p><div class="dialog-actions"><button class="secondary" type="button" data-close="batch-dialog">Cancel</button><button type="submit">Add batch</button></div></form></dialog>
   <dialog id="receipt-dialog">

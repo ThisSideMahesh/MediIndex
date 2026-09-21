@@ -1352,3 +1352,295 @@ dialog form {
 .badge-pending   { background: var(--warning-bg); color: var(--warning-text); }
 .badge-rejected, .badge-cancelled { background: #e2e8f0; color: #475569; }
 .badge-completed { background: #eff6ff; color: #1d4ed8; }
+
+/* ====================================================
+   MANUAL MEDICINE REQUESTS
+   Reuses the existing palette, badge and panel conventions.
+   ==================================================== */
+
+.nav-badge {
+  display: inline-block;
+  min-width: 1.25rem;
+  margin-left: 0.4rem;
+  padding: 0.05rem 0.35rem;
+  border-radius: 999px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 700;
+  line-height: 1.4;
+  text-align: center;
+  vertical-align: middle;
+}
+
+.mreq-heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.mreq-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.5rem 0 1rem;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.5rem;
+}
+
+.mreq-tab {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.45rem 0.9rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mreq-tab.active {
+  background: var(--accent-light);
+  border-color: var(--accent);
+  color: var(--accent-dark);
+}
+
+.mreq-list {
+  display: grid;
+  gap: 1rem;
+}
+
+.mreq-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 1rem 1.1rem;
+  background: var(--surface);
+}
+
+.mreq-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.mreq-card-head h3 {
+  margin: 0 0 0.2rem;
+  font-size: 1.05rem;
+}
+
+.mreq-card-head p { margin: 0; }
+
+.mreq-coverage { margin: 0.85rem 0; }
+
+.mreq-coverage-figures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+}
+
+.mreq-coverage-figures strong { color: var(--ink); }
+
+.mreq-coverage-track {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.mreq-coverage-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.mreq-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.1rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+  margin-bottom: 0.5rem;
+}
+
+.mreq-meta strong { color: var(--ink); }
+
+.mreq-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}
+
+/* Progressive search ladder */
+.mreq-search {
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  padding: 0.7rem 0.9rem;
+  margin: 0.85rem 0;
+  background: #f8fafc;
+}
+
+.mreq-search-headline {
+  margin: 0 0 0.45rem;
+  font-size: 0.86rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.mreq-zone-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.2rem;
+}
+
+.mreq-zone {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.mreq-zone.reached { color: var(--ink); }
+
+.mreq-zone-dot { color: var(--line); font-size: 0.75rem; }
+.mreq-zone.reached .mreq-zone-dot { color: var(--accent); }
+
+/* Incoming request offer controls */
+.mreq-offer-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: flex-end;
+  margin-top: 0.6rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid var(--line);
+}
+
+.mreq-offer-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+  margin: 0;
+}
+
+.mreq-offer-input {
+  width: 7rem;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+
+.mreq-nostock {
+  margin: 0;
+  flex: 1 1 14rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--warning-text);
+  background: var(--warning-bg);
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+}
+
+.mreq-commit-note { margin: 0.3rem 0 0; font-style: italic; }
+
+.mreq-notice {
+  margin: 0.6rem 0;
+  padding: 0.55rem 0.75rem;
+  border-radius: 8px;
+  background: var(--accent-light);
+  color: var(--accent-dark);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.mreq-success-text { color: var(--success-text); }
+
+/* Detail dialog */
+.mreq-detail-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 0.4rem;
+}
+
+.mreq-offers-heading {
+  margin: 1rem 0 0.5rem;
+  font-size: 0.95rem;
+}
+
+.mreq-offer-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.6rem;
+}
+
+.mreq-offer-item {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.6rem 0.75rem;
+}
+
+.mreq-offer-main {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.mreq-offer-figures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+  margin-top: 0.25rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.mreq-offer-figures strong { color: var(--ink); }
+
+/* Status badges — request and offer states */
+.mreq-badge-open              { background: #eff6ff; color: #1d4ed8; }
+.mreq-badge-partially_covered { background: var(--warning-bg); color: var(--warning-text); }
+.mreq-badge-fully_covered     { background: var(--success-bg); color: var(--success-text); }
+.mreq-badge-no_coverage       { background: var(--danger-bg); color: var(--danger); }
+.mreq-badge-cancelled         { background: #e2e8f0; color: #475569; }
+.mreq-badge-expired           { background: #e2e8f0; color: #475569; }
+.mreq-badge-pending           { background: var(--warning-bg); color: var(--warning-text); }
+.mreq-badge-accepted          { background: var(--success-bg); color: var(--success-text); }
+.mreq-badge-declined          { background: var(--danger-bg); color: var(--danger); }
+.mreq-badge-superseded        { background: #e2e8f0; color: #475569; }
+.mreq-badge-urgent            { background: var(--danger-bg); color: var(--danger); }
+
+#mreq-detail-dialog { max-width: 42rem; width: min(42rem, 94vw); }
+
+/* Responsive: stack cleanly on tablet and mobile */
+@media (max-width: 720px) {
+  .mreq-heading-actions { width: 100%; }
+  .mreq-heading-actions button { flex: 1 1 auto; }
+  .mreq-card-head { flex-direction: column; }
+  .mreq-coverage-figures { gap: 0.5rem 0.9rem; }
+  .mreq-meta { flex-direction: column; gap: 0.25rem; }
+  .mreq-offer-row { flex-direction: column; align-items: stretch; }
+  .mreq-offer-input { width: 100%; }
+  .mreq-offer-row button { width: 100%; min-height: 2.6rem; }
+  .mreq-card-actions button { flex: 1 1 100%; min-height: 2.6rem; }
+  .mreq-tab { flex: 1 1 auto; min-height: 2.5rem; }
+  #mreq-detail-dialog { width: 96vw; }
+}
