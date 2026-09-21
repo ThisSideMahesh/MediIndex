@@ -980,6 +980,61 @@ forEachDb('MREQ-061: cancellation supersedes pending offers and preserves histor
   assert.equal(replay.idempotentReplay, true, 'cancellation is idempotent');
 });
 
+forEachDb('MREQ-065: a NO_COVERAGE request is still cancellable while within its lifetime', async (h) => {
+  const requester = await seedRequester(h);
+  // Only an out-of-range pharmacy, so the search exhausts every zone.
+  await addStockedPharmacy(h, 'Delhi', COORDS.delhi, 'Paracetamol', 500);
+  const before = await snapshotInventory(h);
+
+  const req = await createStandardRequest(h, requester, 50);
+  const summary = await h.engine.advanceRequest(req.id);
+  assert.equal(summary.status, 'NO_COVERAGE', 'precondition: the search must exhaust all zones');
+
+  // The record is still within its 72h lifetime.
+  const live = await h.db.get('SELECT expires_at FROM medicine_requests WHERE id = ?', [req.id]);
+  assert.ok(new Date(live.expires_at).getTime() > h.now(), 'precondition: not yet expired');
+
+  // NO_COVERAGE -> CANCELLED is permitted.
+  const res = await h.engine.cancelRequest({ requestId: req.id, pharmacyId: requester.pharmacyId });
+  assert.equal(res.cancelled, true);
+  assert.equal(res.request.status, 'CANCELLED');
+
+  // Cancellation is a pure status transition: no offers created, no search restarted.
+  assert.equal(Number(res.request.current_zone_index), 3, 'the zone index must not be rewound');
+  assert.equal(Number(res.request.current_radius_km), 100, 'the radius must not be reset to 10 km');
+  assert.equal(Number(res.request.covered_quantity), 0, 'coverage must be untouched');
+
+  // Idempotent repeat.
+  const again = await h.engine.cancelRequest({ requestId: req.id, pharmacyId: requester.pharmacyId });
+  assert.equal(again.idempotentReplay, true);
+  assert.equal(again.request.status, 'CANCELLED');
+
+  // No inventory movement.
+  const after = await snapshotInventory(h);
+  assert.equal(after.batches, before.batches);
+  assert.equal(after.movements, before.movements);
+  assert.equal(after.movements, 0);
+});
+
+forEachDb('MREQ-066: EXPIRED remains non-cancellable and tenant isolation still holds', async (h) => {
+  const requester = await seedRequester(h);
+  const b = await addStockedPharmacy(h, 'Pharmacy B', COORDS.near, 'Paracetamol', 80);
+  const req = await createStandardRequest(h, requester, 50);
+  await h.engine.advanceRequest(req.id);
+
+  // A non-requester can never cancel, whatever the status.
+  await expectError(() => h.engine.cancelRequest({ requestId: req.id, pharmacyId: b }), 'NOT_FOUND', 404);
+
+  // Let the request expire, then confirm cancellation is refused.
+  h.advanceClock(73 * 60 * 60 * 1000);
+  await h.engine.expireDue();
+  assert.equal((await h.db.get('SELECT status FROM medicine_requests WHERE id = ?', [req.id])).status, 'EXPIRED');
+  const err = await expectError(
+    () => h.engine.cancelRequest({ requestId: req.id, pharmacyId: requester.pharmacyId }),
+    'CONFLICT', 409);
+  assert.match(String(err.message), /can no longer be cancelled \(EXPIRED\)/);
+});
+
 forEachDb('MREQ-062: request lifecycle covers OPEN, PARTIALLY_COVERED, FULLY_COVERED', async (h) => {
   const requester = await seedRequester(h);
   const b = await addStockedPharmacy(h, 'B', COORDS.near, 'Paracetamol', 20);

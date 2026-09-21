@@ -1559,17 +1559,23 @@ const MREQ_OFFER_LABELS = {
   EXPIRED: 'EXPIRED'
 };
 
+// Mirrors CANCELLABLE_REQUEST_STATUSES in medicine-requests.js. Kept in sync so
+// the UI never offers an action the server would reject, and never hides one it
+// would accept. EXPIRED is excluded (final); CANCELLED is already cancelled.
+const MREQ_CANCELLABLE_STATUSES = ['OPEN', 'PARTIALLY_COVERED', 'FULLY_COVERED', 'NO_COVERAGE'];
+
 /**
  * Whether the requester may cancel a request from the UI.
  *
- * Only the requesting pharmacy, and only while the request is still an active,
- * open search — OPEN or PARTIALLY_COVERED. Per the approved UI rules the action
- * is deliberately NOT offered for CANCELLED, EXPIRED, NO_COVERAGE or
- * FULLY_COVERED. The backend remains authoritative and re-checks on every call;
- * this is a display gate only, kept intentionally no broader than the server.
+ * Only the requesting pharmacy, and only while the backend would still accept a
+ * cancellation. A request keeps its record and its 72-hour lifetime after the
+ * search finishes, so NO_COVERAGE and FULLY_COVERED remain cancellable — the
+ * requester can close the request out instead of waiting for it to expire.
+ * The backend remains authoritative and re-checks on every call; this is a
+ * display gate only, kept exactly as wide as the server rule.
  */
 function mreqCanCancel(status, isRequester) {
-  return isRequester === true && ['OPEN', 'PARTIALLY_COVERED'].includes(status);
+  return isRequester === true && MREQ_CANCELLABLE_STATUSES.includes(status);
 }
 
 function mreqStatusBadge(status) {
@@ -1690,8 +1696,10 @@ function mreqMyCard(request) {
       <div class="mreq-card-actions">
         <button type="button" class="secondary small-btn" data-mreq-detail="${request.id}">View offers</button>
         ${['OPEN', 'PARTIALLY_COVERED'].includes(request.status)
-          ? `<button type="button" class="secondary small-btn" data-mreq-advance="${request.id}">Continue search</button>
-             <button type="button" class="danger small-btn" data-mreq-cancel="${request.id}">Cancel Request</button>`
+          ? `<button type="button" class="secondary small-btn" data-mreq-advance="${request.id}">Continue search</button>`
+          : ''}
+        ${mreqCanCancel(request.status, true)
+          ? `<button type="button" class="danger small-btn" data-mreq-cancel="${request.id}">Cancel Request</button>`
           : ''}
       </div>
     </article>`;

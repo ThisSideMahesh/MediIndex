@@ -747,6 +747,75 @@ forEachDb('API-052: offering after cancellation returns JSON 409', async (h) => 
   assertSafeJson(res);
 });
 
+forEachDb('API-054: a requester can cancel a NO_COVERAGE request over HTTP; others cannot', async (h) => {
+  await setupRequester(h);
+  // Only an out-of-range pharmacy → the search exhausts every zone.
+  const far = await addTenant(h, 'Tenant Far', COORDS.delhi, { stock: 500 });
+  const reqCookie = await login(h, 'staff@mediindex.local');
+  const before = await inventorySnapshot(h);
+
+  const created = await createRequest(h, reqCookie);
+  assert.equal(created.body.request.status, 'NO_COVERAGE', 'precondition');
+  const id = created.body.request.id;
+
+  // A pharmacy that is not the requester must not be able to cancel it.
+  const bad = await h.request({
+    method: 'POST', url: `/api/inter-pharmacy/medicine-requests/${id}/cancel`,
+    cookie: await login(h, far.staffEmail), body: {}
+  });
+  assert.equal(bad.status, 404, 'a non-requester cancel must be refused');
+  assertSafeJson(bad);
+  assert.equal((await h.db.get('SELECT status FROM medicine_requests WHERE id = ?', [id])).status, 'NO_COVERAGE');
+
+  // The requester can cancel it, and the response is safe JSON.
+  const ok = await h.request({
+    method: 'POST', url: `/api/inter-pharmacy/medicine-requests/${id}/cancel`,
+    cookie: reqCookie, body: {}
+  });
+  assert.equal(ok.status, 200, ok.raw);
+  assertSafeJson(ok);
+  assert.equal(ok.body.cancelled, true);
+  assert.equal(ok.body.request.status, 'CANCELLED');
+  // Search state is preserved, not rewound.
+  assert.equal(ok.body.request.currentZoneIndex, 3);
+  assert.equal(ok.body.request.currentRadiusKm, 100);
+
+  // Repeat is idempotent.
+  const again = await h.request({
+    method: 'POST', url: `/api/inter-pharmacy/medicine-requests/${id}/cancel`,
+    cookie: reqCookie, body: {}
+  });
+  assert.equal(again.status, 200);
+  assert.equal(again.body.request.status, 'CANCELLED');
+  assert.equal(again.body.idempotentReplay, true);
+
+  // No new offers were created and no inventory moved.
+  const offers = await h.db.query('SELECT COUNT(*) AS n FROM medicine_request_offers WHERE request_id = ?', [id]);
+  assert.equal(Number(offers[0].n), 0, 'cancelling must not create offers');
+  const after = await inventorySnapshot(h);
+  assert.equal(after.batches, before.batches);
+  assert.equal(after.movements, before.movements);
+  assert.equal(after.movements, 0);
+});
+
+forEachDb('API-055: an EXPIRED request still cannot be cancelled (safe 409)', async (h) => {
+  await setupRequester(h);
+  await addTenant(h, 'Tenant B', COORDS.near, { stock: 80 });
+  const reqCookie = await login(h, 'staff@mediindex.local');
+  const adminCookie = await login(h, 'admin@mediindex.local');
+  const id = (await createRequest(h, reqCookie)).body.request.id;
+
+  await h.db.run('UPDATE medicine_requests SET expires_at = ? WHERE id = ?', [new Date(Date.now() - 1000).toISOString(), id]);
+  await h.request({ method: 'POST', url: '/api/inter-pharmacy/medicine-requests/maintenance/expire', cookie: adminCookie, body: {} });
+  assert.equal((await h.db.get('SELECT status FROM medicine_requests WHERE id = ?', [id])).status, 'EXPIRED');
+
+  const res = await h.request({ method: 'POST', url: `/api/inter-pharmacy/medicine-requests/${id}/cancel`, cookie: reqCookie, body: {} });
+  assert.equal(res.status, 409, 'an expired request must not be cancellable');
+  assertSafeJson(res);
+  assert.equal(res.body.code, 'CONFLICT');
+  assert.match(res.body.error, /EXPIRED/);
+});
+
 forEachDb('API-053: invalid offer quantities return JSON 400', async (h) => {
   await setupRequester(h);
   const b = await addTenant(h, 'Tenant B', COORDS.near, { stock: 80 });

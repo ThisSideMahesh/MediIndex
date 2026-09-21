@@ -352,13 +352,23 @@ test('UI-030: a requester card shows every required field', () => {
   assert.match(html, /data-mreq-cancel="7"/, 'an open request is cancellable');
 });
 
-test('UI-031: terminal requests hide cancel and continue-search actions', () => {
+test('UI-031: a finished search never offers continue-search; final states offer no cancel', () => {
   const s = ui();
-  for (const status of ['NO_COVERAGE', 'CANCELLED', 'EXPIRED']) {
+  // Once the search has stopped, "Continue search" must never be offered.
+  for (const status of ['NO_COVERAGE', 'FULLY_COVERED', 'CANCELLED', 'EXPIRED']) {
     const html = s.mreqMyCard(sampleRequest({ status }));
-    assert.doesNotMatch(html, /data-mreq-cancel/, `${status} must not offer cancel`);
     assert.doesNotMatch(html, /data-mreq-advance/, `${status} must not offer continue-search`);
     assert.match(html, /data-mreq-detail/, 'detail remains viewable');
+  }
+  // Final states (already cancelled / elapsed) offer no cancel either.
+  for (const status of ['CANCELLED', 'EXPIRED']) {
+    assert.doesNotMatch(s.mreqMyCard(sampleRequest({ status })), /data-mreq-cancel/,
+      `${status} must not offer cancel`);
+  }
+  // But a still-live request whose search finished remains cancellable.
+  for (const status of ['NO_COVERAGE', 'FULLY_COVERED']) {
+    assert.match(s.mreqMyCard(sampleRequest({ status })), /data-mreq-cancel/,
+      `${status} is still within its lifetime and must remain cancellable`);
   }
 });
 
@@ -511,19 +521,57 @@ test('UI-063: cancellation asks for confirmation', () => {
 
 // ── Cancel Request action in the requester detail modal (the reported bug) ──
 
-test('UI-063a: mreqCanCancel is true only for the requester on an active request', () => {
+test('UI-063a: mreqCanCancel mirrors the backend CANCELLABLE_REQUEST_STATUSES exactly', () => {
   const s = ui();
-  // Requester + active states → cancellable
+  // The UI gate must be exactly as wide as the server rule — never narrower
+  // (hiding a valid action) and never wider (offering a guaranteed 409).
+  const { CANCELLABLE_REQUEST_STATUSES } = require('../medicine-requests')
+    .createMedicineRequestEngine({
+      db: { get: () => null, run: () => ({}), query: () => [], transaction: (f) => f({}) },
+      isPg: false, haversineKm: () => 0
+    });
+
+  for (const st of CANCELLABLE_REQUEST_STATUSES) {
+    assert.equal(s.mreqCanCancel(st, true), true,
+      `${st} is cancellable server-side, so the UI must offer the action`);
+  }
+  // A requester-owned NO_COVERAGE request is still within its lifetime → cancellable.
+  assert.equal(s.mreqCanCancel('NO_COVERAGE', true), true);
   assert.equal(s.mreqCanCancel('OPEN', true), true);
   assert.equal(s.mreqCanCancel('PARTIALLY_COVERED', true), true);
-  // Requester + terminal/covered states → not cancellable (per approved UI rules)
-  for (const st of ['FULLY_COVERED', 'NO_COVERAGE', 'CANCELLED', 'EXPIRED']) {
-    assert.equal(s.mreqCanCancel(st, true), false, `${st} must not be cancellable from the UI`);
-  }
-  // Non-requester → never cancellable, whatever the status
-  for (const st of ['OPEN', 'PARTIALLY_COVERED', 'FULLY_COVERED']) {
+  assert.equal(s.mreqCanCancel('FULLY_COVERED', true), true);
+
+  // Final states are never cancellable.
+  assert.equal(s.mreqCanCancel('EXPIRED', true), false, 'an expired request is final');
+  assert.equal(s.mreqCanCancel('CANCELLED', true), false, 'an already-cancelled request needs no action');
+
+  // Non-requester → never cancellable, whatever the status.
+  for (const st of ['OPEN', 'PARTIALLY_COVERED', 'FULLY_COVERED', 'NO_COVERAGE']) {
     assert.equal(s.mreqCanCancel(st, false), false, `a non-requester must not get cancel for ${st}`);
   }
+});
+
+test('UI-063h: a requester-owned NO_COVERAGE request offers Cancel Request in card and modal', () => {
+  const s = ui();
+  const noCoverage = sampleRequest({
+    status: 'NO_COVERAGE', coveredQuantity: 0, remainingQuantity: 50,
+    currentZoneIndex: 3, currentRadiusKm: 100,
+    expiresAt: new Date(Date.now() + 71 * 3600 * 1000).toISOString()   // still within its 72h life
+  });
+
+  // Card: Cancel Request present, but "Continue search" is NOT — the search is exhausted.
+  const card = s.mreqMyCard(noCoverage);
+  assert.match(card, /data-mreq-cancel="7"/, 'the NO_COVERAGE card must offer Cancel Request');
+  assert.match(card, /Cancel Request/);
+  assert.doesNotMatch(card, /data-mreq-advance/,
+    'an exhausted search must not offer Continue search');
+  assert.match(card, /NO COVERAGE/, 'the status is still shown honestly');
+  assert.match(card, /Expires in/, 'the remaining lifetime is still shown');
+
+  // Modal: the same helper drives the action row.
+  assert.equal(s.mreqCanCancel(noCoverage.status, true), true);
+  // And the search narrative still says the search has stopped.
+  assert.match(s.mreqSearchProgress(noCoverage, []), /No coverage found within the maximum 100 km radius/);
 });
 
 test('UI-063b: the detail modal shows a Cancel Request action for a cancellable own request', () => {
@@ -557,9 +605,9 @@ test('UI-063c: a non-requester viewing the request gets no cancel action in the 
   assert.equal(s.mreqCanCancel('PARTIALLY_COVERED', isRequester), false);
 });
 
-test('UI-063d: CANCELLED, EXPIRED and FULLY_COVERED requests show no cancel action anywhere', () => {
+test('UI-063d: CANCELLED and EXPIRED requests show no cancel action anywhere', () => {
   const s = ui();
-  for (const status of ['CANCELLED', 'EXPIRED', 'FULLY_COVERED', 'NO_COVERAGE']) {
+  for (const status of ['CANCELLED', 'EXPIRED']) {
     // My Requests card
     assert.doesNotMatch(s.mreqMyCard(sampleRequest({ status })), /data-mreq-cancel/,
       `the ${status} card must not offer cancel`);
@@ -813,6 +861,53 @@ forEachDb(test, 'UI-106: cancel succeeds, flips status to CANCELLED, and disable
   assert.equal(after.totalUnits, before.totalUnits);
   assert.equal(after.movements, before.movements);
   assert.equal(after.movements, 0);
+});
+
+forEachDb(test, 'UI-108: the reported NO_COVERAGE scenario is cancellable end to end', async (h) => {
+  // Reproduces the manual-verification screenshot: requested 50, covered 0,
+  // remaining 50, zone 4 of 4, 100 km, still within its 72h lifetime.
+  await setupRequester(h);
+  await addTenant(h, 'Tenant Far', COORDS.delhi, { stock: 500 });   // out of every zone
+  const reqCookie = await login(h, 'staff@mediindex.local');
+  const before = await inventorySnapshot(h);
+
+  const created = await createRequest(h, reqCookie, { requestedQuantity: 50 });
+  const r = created.body.request;
+  assert.equal(r.status, 'NO_COVERAGE');
+  assert.equal(r.requestedQuantity, 50);
+  assert.equal(r.coveredQuantity, 0);
+  assert.equal(r.remainingQuantity, 50);
+  assert.equal(r.currentZoneIndex, 3);
+  assert.equal(r.currentRadiusKm, 100);
+  assert.equal(r.zoneCount, 4);
+
+  const s = ui();
+  // The lifetime countdown still renders (matching "Expires in 2d 23h").
+  assert.ok(s.formatRemaining(r.expiresAt), 'the request must still show a lifetime countdown');
+  // The card now offers Cancel Request — the bug that was reported.
+  const card = s.mreqMyCard(r);
+  assert.match(card, /data-mreq-cancel/, 'the NO_COVERAGE card must offer Cancel Request');
+  assert.doesNotMatch(card, /data-mreq-advance/, 'and must not offer Continue search');
+  // The modal gate agrees.
+  const detail = await h.request({ method: 'GET', url: `/api/inter-pharmacy/medicine-requests/${r.id}`, cookie: reqCookie });
+  assert.equal(detail.body.viewerRole, 'REQUESTER');
+  assert.equal(s.mreqCanCancel(detail.body.request.status, true), true);
+
+  // Cancelling succeeds and the action disappears.
+  const cancel = await h.request({ method: 'POST', url: `/api/inter-pharmacy/medicine-requests/${r.id}/cancel`, cookie: reqCookie, body: {} });
+  assert.equal(cancel.status, 200, cancel.raw);
+  assert.equal(cancel.body.request.status, 'CANCELLED');
+  assert.doesNotMatch(s.mreqMyCard(cancel.body.request), /data-mreq-cancel/);
+  assert.match(s.mreqMyCard(cancel.body.request), /CANCELLED/);
+
+  // No inventory moved, no offers invented.
+  const after = await inventorySnapshot(h);
+  assert.equal(after.batches, before.batches);
+  assert.equal(after.totalUnits, before.totalUnits);
+  assert.equal(after.movements, before.movements);
+  assert.equal(after.movements, 0);
+  const offers = await h.db.query('SELECT COUNT(*) AS n FROM medicine_request_offers WHERE request_id = ?', [r.id]);
+  assert.equal(Number(offers[0].n), 0);
 });
 
 forEachDb(test, 'UI-107: a non-requester cannot cancel (safe 404) and the UI hides the action for them', async (h) => {

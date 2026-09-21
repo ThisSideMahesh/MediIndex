@@ -41,6 +41,20 @@ const MEDICINE_REQUEST_TTL_MS = 72 * 60 * 60 * 1000;    // 72 hours
 
 // Request statuses in which a request is still actionable (accepts offers).
 const ACTIONABLE_REQUEST_STATUSES = ['OPEN', 'PARTIALLY_COVERED'];
+// Request statuses the REQUESTER may still cancel.
+//
+// Deliberately broader than ACTIONABLE_REQUEST_STATUSES: "no longer accepting
+// offers" is not the same as "no longer cancellable". A request keeps its record
+// (and its 72h lifetime) after the search finishes, so the requester must be able
+// to close it out rather than wait for it to expire:
+//   FULLY_COVERED — search satisfied, awaiting fulfilment
+//   NO_COVERAGE   — search exhausted all zones without cover, still within TTL
+// Cancelling either is a pure status transition. Neither reserves capacity
+// (see RESERVING_REQUEST_STATUSES for FULLY_COVERED, which releases on cancel)
+// and neither holds PENDING offers, so no search is restarted and no stock moves.
+// EXPIRED is excluded — an elapsed request is final. CANCELLED is handled
+// earlier as an idempotent replay.
+const CANCELLABLE_REQUEST_STATUSES = ['OPEN', 'PARTIALLY_COVERED', 'FULLY_COVERED', 'NO_COVERAGE'];
 // Request statuses whose ACCEPTED offers still consume soft-reserved capacity.
 // CANCELLED and EXPIRED are absent, so their reservations are released.
 // FULLY_COVERED stays reserved until the future controlled fulfilment workflow.
@@ -783,7 +797,7 @@ function createMedicineRequestEngine(deps = {}) {
 
       if (request.status === 'CANCELLED')
         return { request, cancelled: false, idempotentReplay: true };
-      if (!ACTIONABLE_REQUEST_STATUSES.includes(request.status) && request.status !== 'FULLY_COVERED')
+      if (!CANCELLABLE_REQUEST_STATUSES.includes(request.status))
         throw conflictError(`This request can no longer be cancelled (${request.status}).`,
           { requestStatus: request.status });
 
@@ -992,6 +1006,7 @@ function createMedicineRequestEngine(deps = {}) {
     OFFER_RESPONSE_WINDOW_MS,
     MEDICINE_REQUEST_TTL_MS,
     ACTIONABLE_REQUEST_STATUSES,
+    CANCELLABLE_REQUEST_STATUSES,
     RESERVING_REQUEST_STATUSES,
     // commands
     createRequest,
