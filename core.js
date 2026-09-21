@@ -37,6 +37,15 @@ const adapter = createDatabaseAdapter({ dataDir: DATA_DIR, dbPath: DB_PATH }).in
 // for local dev.
 const db = adapter;
 
+// For PostgreSQL, begin idempotent schema application immediately at module load
+// so it is already in flight (usually already complete) by the time the first
+// request is routed. handler() still awaits it, which is a no-op once settled.
+// The .catch() here only prevents an unhandled rejection at load time — the real
+// error is surfaced to the caller by the await inside handler().
+if (adapter.type === 'postgres' && typeof adapter.ensureSchema === 'function') {
+  adapter.ensureSchema().catch(() => {});
+}
+
 // ─── SQL dialect helpers ───────────────────────────────────────────────────
 // SQLite uses date('now', '+N days'); PostgreSQL uses CURRENT_DATE + N.
 // Both databases accept CURRENT_DATE for "today".
@@ -780,6 +789,19 @@ async function processNearExpiryRedistribution(pharmacyId, opts = {}) {
 
 async function handler(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
+
+  // On PostgreSQL, apply db/schema.pg.sql once per process before serving any
+  // request. SQLite self-migrates in its initialize(); PostgreSQL previously did
+  // not, so DDL appended to schema.pg.sql never reached the deployed database.
+  // ensureSchema() is memoized and idempotent — effectively free after the first call.
+  if (isPg && typeof adapter.ensureSchema === 'function') {
+    try {
+      await adapter.ensureSchema();
+    } catch (err) {
+      console.error('Schema initialization failed:', err);
+      return json(res, 503, { error: 'The database is not ready. Please try again shortly.' });
+    }
+  }
 
   // Health check — performs a real DB query so connectivity is verified.
   if (req.method === 'GET' && url.pathname === '/api/health') {
