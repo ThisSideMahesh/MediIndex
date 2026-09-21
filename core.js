@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { createDatabaseAdapter } = require('./db/index');
+const { createMedicineRequestEngine, MedicineRequestError } = require('./medicine-requests');
 
 const PORT = Number(process.env.PORT || 3000);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -125,6 +126,91 @@ function haversineKm(lat1, lng1, lat2, lng2) {
           + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180)
           * Math.sin(dLng / 2) ** 2;
   return R * 2 * Math.asin(Math.sqrt(a));
+}
+
+// ─── Manual medicine request engine ──────────────────────────────────────────
+// A single shared instance. The API layer delegates every rule to this engine
+// rather than re-implementing logic in route handlers. Completely separate from
+// processNearExpiryRedistribution and medicine_redistribution_requests, which it
+// neither reads nor writes.
+const medicineRequestEngine = createMedicineRequestEngine({
+  db,
+  isPg,
+  haversineKm,
+  isDuplicateError
+});
+
+/**
+ * Maps a Phase 2 MedicineRequestError onto the project's JSON error convention.
+ * VALIDATION -> 400, NOT_FOUND -> 404, CONFLICT -> 409. Anything unexpected is
+ * logged server-side and reported as a generic 500, so stack traces, SQL and
+ * connection details are never returned to a client.
+ */
+function medicineRequestError(res, error) {
+  if (error instanceof MedicineRequestError) {
+    const body = { error: error.message, code: error.code };
+    // details only ever carry the caller's own figures (their stock, the
+    // request's outstanding quantity), never another tenant's data.
+    if (error.details !== undefined) body.details = error.details;
+    return json(res, error.status, body);
+  }
+  console.error(error);
+  return json(res, 500, { error: 'Internal server error.' });
+}
+
+/** Rejects any attempt to supply pharmacy context from the client. */
+function rejectsClientPharmacy(res, input) {
+  if (input && (input.pharmacyId !== undefined || input.pharmacy_id !== undefined)) {
+    json(res, 400, { error: 'Client must not supply pharmacy_id. Pharmacy context is derived from the authenticated session.' });
+    return true;
+  }
+  return false;
+}
+
+/** API shape for a medicine request. Internal columns are deliberately omitted. */
+function serializeMedicineRequest(r) {
+  if (!r) return null;
+  const out = {
+    id: r.id,
+    status: r.status,
+    requesterPharmacyId: r.requester_pharmacy_id,
+    medicineId: r.medicine_id,
+    medicineName: r.medicine_name,
+    requestedQuantity: r.requested_quantity,
+    coveredQuantity: r.covered_quantity,
+    remainingQuantity: Math.max(0, r.requested_quantity - r.covered_quantity),
+    priority: r.priority,
+    reason: r.reason,
+    currentZoneIndex: r.current_zone_index,
+    currentRadiusKm: r.current_radius_km,
+    zoneCount: medicineRequestEngine.MEDICINE_REQUEST_ZONES_KM.length,
+    maxRadiusKm: medicineRequestEngine.MEDICINE_REQUEST_MAX_RADIUS_KM,
+    expiresAt: r.expires_at,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at
+  };
+  if (r.offerSummary) out.offerSummary = r.offerSummary;
+  return out;
+}
+
+/** API shape for an offer. */
+function serializeMedicineOffer(o) {
+  if (!o) return null;
+  return {
+    id: o.id,
+    requestId: o.request_id,
+    pharmacyId: o.pharmacy_id,
+    pharmacyName: o.pharmacy_name === undefined ? undefined : o.pharmacy_name,
+    status: o.status,
+    offeredQuantity: o.offered_quantity,
+    distanceKm: o.distance_km,
+    zoneIndex: o.zone_index,
+    usableStockAtContact: o.usable_stock_at_contact,
+    declineReason: o.decline_reason,
+    respondBy: o.respond_by,
+    respondedAt: o.responded_at,
+    contactedAt: o.contacted_at
+  };
 }
 
 function parseCookies(req) {
@@ -1601,6 +1687,211 @@ async function handler(req, res) {
     } catch (error) { return json(res, 400, { error: error.message }); }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MANUAL MEDICINE REQUESTS — progressive geographic search
+  //
+  // Every rule lives in medicineRequestEngine (Phase 2). These handlers only
+  // authenticate, authorize, derive the pharmacy from the session, translate
+  // input/output, and map domain errors onto HTTP. No business logic is
+  // duplicated here, and no route touches inventory.
+  //
+  // Normal pharmacy operation is available to STAFF and ADMIN alike.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ─── GET /api/inter-pharmacy/medicine-requests/incoming ───────────────────
+  // Requests this pharmacy has actually been contacted for. Declared before the
+  // /:id routes so the literal path is never treated as an identifier.
+  if (req.method === 'GET' && url.pathname === '/api/inter-pharmacy/medicine-requests/incoming') {
+    if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
+    try {
+      const incoming = await medicineRequestEngine.listIncomingForPharmacy(user.pharmacy_id);
+      return json(res, 200, { incoming, count: incoming.length });
+    } catch (error) { return medicineRequestError(res, error); }
+  }
+
+  // ─── POST /api/inter-pharmacy/medicine-requests/maintenance/expire ────────
+  // ADMIN-only, and tenant-scoped: expires only this pharmacy's own overdue
+  // requests and the offers belonging to / addressed to this pharmacy. The
+  // unscoped sweep remains an internal service call and is never exposed.
+  if (req.method === 'POST' && url.pathname === '/api/inter-pharmacy/medicine-requests/maintenance/expire') {
+    if (!requireRole(res, user, 'ADMIN')) return;
+    try {
+      const result = await medicineRequestEngine.expireDue({ pharmacyId: user.pharmacy_id });
+      return json(res, 200, { ...result, scope: 'PHARMACY' });
+    } catch (error) { return medicineRequestError(res, error); }
+  }
+
+  // ─── POST /api/inter-pharmacy/medicine-requests ───────────────────────────
+  // Creates a request. Requester pharmacy and user come from the session only.
+  if (req.method === 'POST' && url.pathname === '/api/inter-pharmacy/medicine-requests') {
+    if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
+    try {
+      const input = await readJson(req);
+      if (rejectsClientPharmacy(res, input)) return;
+      if (input.requesterPharmacyId !== undefined) {
+        return json(res, 400, { error: 'Client must not supply requesterPharmacyId. Pharmacy context is derived from the authenticated session.' });
+      }
+
+      const result = await medicineRequestEngine.createRequest({
+        pharmacyId: user.pharmacy_id,          // authoritative
+        userId: user.user_id || user.id,       // authoritative
+        medicineName: input.medicineName,
+        medicineId: Number.isInteger(input.medicineId) ? input.medicineId : undefined,
+        requestedQuantity: input.requestedQuantity,
+        priority: input.priority,
+        reason: input.reason,
+        idempotencyKey: input.idempotencyKey
+      });
+
+      // Kick off the progressive search immediately so the first zone is
+      // contacted as part of creation. Failure here must not void the request.
+      let search = null;
+      if (result.created) {
+        try {
+          search = await medicineRequestEngine.advanceRequest(result.request.id);
+        } catch (err) { console.error('Initial medicine-request advance failed:', err); }
+      }
+
+      const fresh = await medicineRequestEngine.getRequestDetail(result.request.id, user.pharmacy_id);
+      return json(res, result.created ? 201 : 200, {
+        request: serializeMedicineRequest(fresh.request),
+        offers: fresh.offers.map(serializeMedicineOffer),
+        created: result.created,
+        idempotentReplay: result.idempotentReplay,
+        search: search ? {
+          contacted: search.contacted,
+          zoneIndex: search.zoneIndex,
+          zonesAdvanced: search.zonesAdvanced,
+          waiting: search.waiting
+        } : null
+      });
+    } catch (error) { return medicineRequestError(res, error); }
+  }
+
+  // ─── GET /api/inter-pharmacy/medicine-requests ────────────────────────────
+  // The caller pharmacy's own requests, with an offer summary. Filters: status,
+  // medicine, limit, offset.
+  if (req.method === 'GET' && url.pathname === '/api/inter-pharmacy/medicine-requests') {
+    if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
+    try {
+      const statusParam = url.searchParams.get('status');
+      const VALID = ['OPEN', 'PARTIALLY_COVERED', 'FULLY_COVERED', 'NO_COVERAGE', 'CANCELLED', 'EXPIRED'];
+      if (statusParam && statusParam !== 'ALL' && !VALID.includes(statusParam)) {
+        return json(res, 400, { error: `status must be ALL or one of: ${VALID.join(', ')}.` });
+      }
+      const limitRaw = url.searchParams.get('limit');
+      const offsetRaw = url.searchParams.get('offset');
+      if (limitRaw !== null && !/^\d+$/.test(limitRaw))  return json(res, 400, { error: 'limit must be a non-negative integer.' });
+      if (offsetRaw !== null && !/^\d+$/.test(offsetRaw)) return json(res, 400, { error: 'offset must be a non-negative integer.' });
+
+      const result = await medicineRequestEngine.listRequestsForPharmacy(user.pharmacy_id, {
+        status: statusParam || 'ALL',
+        medicineName: url.searchParams.get('medicine') || undefined,
+        limit: limitRaw === null ? undefined : Number(limitRaw),
+        offset: offsetRaw === null ? undefined : Number(offsetRaw)
+      });
+
+      return json(res, 200, {
+        requests: result.requests.map(serializeMedicineRequest),
+        total: result.total,
+        limit: result.limit,
+        offset: result.offset
+      });
+    } catch (error) { return medicineRequestError(res, error); }
+  }
+
+  // ─── Routes addressing a single medicine request ──────────────────────────
+  const mreqMatch = url.pathname.match(/^\/api\/inter-pharmacy\/medicine-requests\/(\d+)$/);
+  const mreqAction = url.pathname.match(/^\/api\/inter-pharmacy\/medicine-requests\/(\d+)\/(advance|offer|decline|cancel)$/);
+
+  // GET /api/inter-pharmacy/medicine-requests/:id
+  // Requester sees the full picture; a contacted pharmacy sees only its own
+  // response; an unrelated pharmacy gets 404 so existence is not disclosed.
+  if (req.method === 'GET' && mreqMatch) {
+    if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
+    try {
+      const detail = await medicineRequestEngine.getRequestDetail(Number(mreqMatch[1]), user.pharmacy_id);
+      return json(res, 200, {
+        request: serializeMedicineRequest(detail.request),
+        offers: detail.offers.map(serializeMedicineOffer),
+        coveredQuantity: detail.coveredQuantity,
+        remainingQuantity: detail.remainingQuantity,
+        viewerRole: detail.viewerRole
+      });
+    } catch (error) { return medicineRequestError(res, error); }
+  }
+
+  if (mreqAction && req.method === 'POST') {
+    if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
+    const requestId = Number(mreqAction[1]);
+    const action = mreqAction[2];
+    try {
+      const input = await readJson(req);
+      if (rejectsClientPharmacy(res, input)) return;
+
+      // ── advance ── requester pharmacy only; the engine picks the next zone.
+      if (action === 'advance') {
+        if (input.zoneIndex !== undefined || input.radiusKm !== undefined || input.zonesKm !== undefined) {
+          return json(res, 400, { error: 'Client must not choose a search zone or radius. The server determines progression.' });
+        }
+        // requesterPharmacyId is the engine's tenant guard, not client input.
+        await medicineRequestEngine.advanceRequest(requestId, { requesterPharmacyId: user.pharmacy_id });
+        const detail = await medicineRequestEngine.getRequestDetail(requestId, user.pharmacy_id);
+        return json(res, 200, {
+          request: serializeMedicineRequest(detail.request),
+          offers: detail.offers.map(serializeMedicineOffer),
+          coveredQuantity: detail.coveredQuantity,
+          remainingQuantity: detail.remainingQuantity
+        });
+      }
+
+      // ── offer ── responding pharmacy comes from the session only.
+      if (action === 'offer') {
+        const result = await medicineRequestEngine.submitOffer({
+          requestId,
+          pharmacyId: user.pharmacy_id,
+          userId: user.user_id || user.id,
+          offeredQuantity: input.offeredQuantity
+        });
+        return json(res, 200, {
+          offer: serializeMedicineOffer(result.offer),
+          request: serializeMedicineRequest(result.request),
+          coveredQuantity: result.request.covered_quantity,
+          remainingQuantity: Math.max(0, result.request.requested_quantity - result.request.covered_quantity),
+          accepted: result.accepted,
+          idempotentReplay: result.idempotentReplay
+        });
+      }
+
+      // ── decline ──
+      if (action === 'decline') {
+        const result = await medicineRequestEngine.declineRequest({
+          requestId,
+          pharmacyId: user.pharmacy_id,
+          userId: user.user_id || user.id,
+          reason: input.reason
+        });
+        return json(res, 200, {
+          offer: serializeMedicineOffer(result.offer),
+          declined: result.declined,
+          idempotentReplay: result.idempotentReplay
+        });
+      }
+
+      // ── cancel ── requester pharmacy only; releases soft reservations via
+      // the CANCELLED state.
+      const result = await medicineRequestEngine.cancelRequest({
+        requestId,
+        pharmacyId: user.pharmacy_id
+      });
+      return json(res, 200, {
+        request: serializeMedicineRequest(result.request),
+        cancelled: result.cancelled,
+        idempotentReplay: result.idempotentReplay
+      });
+    } catch (error) { return medicineRequestError(res, error); }
+  }
+
   // ─── PUT /api/pharmacies/coordinates ──────────────────────────────────────
   // Allows ADMIN to set coordinates for their own pharmacy.
   if (req.method === 'PUT' && url.pathname === '/api/pharmacies/coordinates') {
@@ -1622,7 +1913,7 @@ async function handler(req, res) {
 }
 
 const server = http.createServer((req, res) => handler(req, res).catch(error => { console.error(error); json(res, 500, { error: 'Internal server error.' }); }));
-module.exports = { server, handler, passwordHash, passwordMatches, hashDeviceToken, hashSessionToken, currentDevice, currentUser, db, adapter, SESSION_TTL_MS, processNearExpiryRedistribution, haversineKm, NEAR_EXPIRY_DAYS, NEARBY_RADIUS_KM };
+module.exports = { server, handler, passwordHash, passwordMatches, hashDeviceToken, hashSessionToken, currentDevice, currentUser, db, adapter, SESSION_TTL_MS, processNearExpiryRedistribution, haversineKm, NEAR_EXPIRY_DAYS, NEARBY_RADIUS_KM, medicineRequestEngine, createMedicineRequestEngine, MedicineRequestError };
 
 if (require.main === module) {
   server.listen(PORT, () => console.log(`MediIndex API running on http://localhost:${PORT}`));
