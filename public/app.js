@@ -58,6 +58,11 @@ async function showApp(user) {
   loginView.hidden = true;
   appView.hidden = false;
 
+  // Show admin-only nav items
+  document.querySelectorAll('.admin-only-nav').forEach(btn => {
+    btn.hidden = (user.role !== 'ADMIN');
+  });
+
   // Initialise client-side sync module
   if (window.MediSync) {
     document.querySelector('#sync-status').hidden = false;
@@ -117,12 +122,14 @@ function switchView(view) {
   document.querySelector('#analytics-view').hidden = view !== 'analytics';
   document.querySelector('#store-map-view').hidden = view !== 'store-map';
   document.querySelector('#expiry-view').hidden = view !== 'expiry';
+  document.querySelector('#redistribution-view').hidden = view !== 'redistribution';
 
   if (view === 'inventory') loadMedicines();
   if (view === 'billing') loadBillingView();
   if (view === 'analytics') loadAnalyticsView();
   if (view === 'store-map') loadStoreMapView();
   if (view === 'expiry') loadAlerts();
+  if (view === 'redistribution') loadRedistributionRequests();
 }
 
 // ----------------------------------------------------
@@ -1336,6 +1343,103 @@ document.querySelector('#alert-list').addEventListener('click', async event => {
 
 document.querySelectorAll('[data-close]').forEach(button => {
   button.addEventListener('click', () => closeDialog(button.dataset.close));
+});
+
+// ----------------------------------------------------
+// NEAR-EXPIRY REDISTRIBUTION
+// ----------------------------------------------------
+
+async function loadRedistributionRequests() {
+  const role   = document.querySelector('#redistrib-role-filter').value;
+  const status = document.querySelector('#redistrib-status-filter').value;
+  const errorEl = document.querySelector('#redistribution-error');
+  errorEl.textContent = '';
+  try {
+    const res = await api(`/api/inter-pharmacy/requests?role=${role}&status=${status}`);
+    const tbody = document.querySelector('#redistribution-body');
+    if (!res.requests || res.requests.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="12" class="muted text-center">No redistribution requests found.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = res.requests.map(r => {
+      const autoBadge = r.automatic_request
+        ? '<span class="badge badge-auto">AUTO</span>'
+        : '<span class="badge">MANUAL</span>';
+      const statusClass = `badge-${(r.status || '').toLowerCase()}`;
+      const dist = r.distance_km != null ? `${r.distance_km} km` : '—';
+      return `
+        <tr>
+          <td><code>#${r.id}</code></td>
+          <td><strong>${escapeHtml(r.medicine_name)}</strong><div class="muted font-xs">${escapeHtml(r.generic_name || '')}</div></td>
+          <td><code>${escapeHtml(r.batch_number)}</code></td>
+          <td>${escapeHtml(r.sender_name)}</td>
+          <td>${escapeHtml(r.recipient_name)}</td>
+          <td><strong>${r.requested_quantity}u</strong></td>
+          <td><span class="${r.days_until_expiry <= 7 ? 'text-danger' : ''}">${r.days_until_expiry ?? '—'}</span></td>
+          <td>${dist}</td>
+          <td><span class="badge ${statusClass}">${r.status}</span></td>
+          <td>${autoBadge}</td>
+          <td>${escapeHtml(r.created_at ? r.created_at.slice(0,10) : '')}</td>
+          <td>
+            ${r.status === 'ACCEPTED' ? `<button class="secondary small-btn" data-redistrib-complete="${r.id}">Complete</button>` : ''}
+            ${['PENDING','ACCEPTED'].includes(r.status) ? `<button class="danger small-btn" data-redistrib-cancel="${r.id}">Cancel</button>` : ''}
+          </td>
+        </tr>
+      `;
+    }).join('');
+  } catch (err) {
+    errorEl.textContent = err.message;
+  }
+}
+
+// Redistribution event listeners
+document.querySelector('#run-redistribution-btn').addEventListener('click', async () => {
+  const btn = document.querySelector('#run-redistribution-btn');
+  const resultEl = document.querySelector('#redistribution-scan-result');
+  const errorEl  = document.querySelector('#redistribution-error');
+  errorEl.textContent = '';
+  btn.disabled = true;
+  btn.textContent = 'Scanning…';
+  try {
+    const res = await api('/api/inter-pharmacy/near-expiry/process', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+    resultEl.className = `redistrib-scan-result${res.created === 0 ? ' no-action' : ''}`;
+    resultEl.innerHTML = res.created > 0
+      ? `<strong>✓ ${res.created} redistribution request${res.created === 1 ? '' : 's'} created and auto-accepted.</strong> ` +
+        `Skipped: ${res.skippedDuplicate} duplicates, ${res.skippedNoCoordinates} without coordinates, ${res.skippedSufficientStock} with sufficient stock. ` +
+        `Threshold: ${res.nearExpiryDays} days · Radius: ${res.nearbyRadiusKm} km.`
+      : `No new requests created. Skipped: ${res.skippedDuplicate} duplicates, ${res.skippedNoCoordinates} without coordinates, ${res.skippedSufficientStock} with sufficient stock. ` +
+        `(Threshold: ${res.nearExpiryDays} days · Radius: ${res.nearbyRadiusKm} km)`;
+    resultEl.hidden = false;
+    await loadRedistributionRequests();
+  } catch (err) {
+    errorEl.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Run Near-Expiry Scan';
+  }
+});
+
+document.querySelector('#refresh-redistribution-btn').addEventListener('click', loadRedistributionRequests);
+document.querySelector('#redistrib-role-filter').addEventListener('change', loadRedistributionRequests);
+document.querySelector('#redistrib-status-filter').addEventListener('change', loadRedistributionRequests);
+
+document.querySelector('#redistribution-body').addEventListener('click', async event => {
+  const completeId = event.target.dataset.redistribComplete;
+  const cancelId   = event.target.dataset.redistribCancel;
+  const id = completeId || cancelId;
+  if (!id) return;
+  const newStatus = completeId ? 'COMPLETED' : 'CANCELLED';
+  try {
+    await api(`/api/inter-pharmacy/requests/${id}/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: newStatus })
+    });
+    await loadRedistributionRequests();
+  } catch (err) {
+    document.querySelector('#redistribution-error').textContent = err.message;
+  }
 });
 
 // Initial session check

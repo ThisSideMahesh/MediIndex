@@ -84,6 +84,40 @@ function json(res, status, body, extraHeaders = {}) {
   res.end(JSON.stringify(body));
 }
 
+// ─── Near-expiry redistribution configuration ─────────────────────────────
+// NEAR_EXPIRY_DAYS: single centralized threshold. A batch qualifies when
+//   days until expiry <= NEAR_EXPIRY_DAYS and quantity > 0 and not expired.
+const NEAR_EXPIRY_DAYS = 20;
+
+// NEARBY_RADIUS_KM: maximum Haversine distance for a recipient to be considered
+//   nearby. Only applied when BOTH sender and recipient have non-NULL lat/lng.
+//   When either coordinate is missing, no proximity match is made — no fake
+//   distances are invented.
+const NEARBY_RADIUS_KM = 50;
+
+// SQL expression: expiry_date <= CURRENT_DATE + NEAR_EXPIRY_DAYS (both adapters)
+const D_NEAR_EXPIRY_CUTOFF = isPg
+  ? `(CURRENT_DATE + ${NEAR_EXPIRY_DAYS})`
+  : `date(CURRENT_DATE, '+${NEAR_EXPIRY_DAYS} days')`;
+
+/**
+ * Haversine great-circle distance between two geographic coordinates.
+ * @param {number} lat1  Latitude of point A (decimal degrees)
+ * @param {number} lng1  Longitude of point A (decimal degrees)
+ * @param {number} lat2  Latitude of point B (decimal degrees)
+ * @param {number} lng2  Longitude of point B (decimal degrees)
+ * @returns {number}  Distance in kilometres
+ */
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const R   = 6371; // Earth radius km
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2
+          + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180)
+          * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.asin(Math.sqrt(a));
+}
+
 function parseCookies(req) {
   return Object.fromEntries((req.headers.cookie || '').split(';').filter(Boolean).map(item => {
     const index = item.indexOf('=');
@@ -574,6 +608,174 @@ async function processMobileStockEntry(device, input) {
     }
     return { success: false, status: 'FAILED', errorCode: 'OPERATION_ERROR', message: error.message };
   }
+}
+
+// ─── processNearExpiryRedistribution ─────────────────────────────────────
+/**
+ * Scans near-expiry batches at `pharmacyId` and creates redistribution requests
+ * to eligible nearby pharmacies that have a confirmed stock need.
+ *
+ * PROXIMITY RULE (strict):
+ *   Both sender and recipient must have non-NULL latitude/longitude.
+ *   If either coordinate is missing, the pair is skipped — no distance is invented.
+ *   Only pairs within nearbyRadiusKm are eligible.
+ *
+ * NEED RULE:
+ *   Recipient's current stock < minimum_stock for the matched medicine.
+ *   INSUFFICIENT_DATA from demand forecasting is NOT a demand signal.
+ *
+ * DUPLICATE PREVENTION (atomic):
+ *   Each request has a deterministic idempotency_key =
+ *     SHA-256(sender_id|recipient_id|medicine_id|batch_id)
+ *   A UNIQUE constraint on that column prevents concurrent duplicates at the
+ *   database level; application-level read-before-write is a secondary guard.
+ *
+ * INVENTORY SAFETY:
+ *   No stock is deducted or transferred. The request status ACCEPTED means
+ *   the request is ready for manual fulfillment.
+ *
+ * @param {number}  pharmacyId  Sender pharmacy to scan.
+ * @param {object}  [opts]      { nearExpiryDays, nearbyRadiusKm }
+ * @returns {{ created, skippedDuplicate, skippedNoCoordinates, skippedSufficientStock, requests }}
+ */
+async function processNearExpiryRedistribution(pharmacyId, opts = {}) {
+  const nearExpiryDays = Number.isInteger(opts.nearExpiryDays)  ? opts.nearExpiryDays  : NEAR_EXPIRY_DAYS;
+  const nearbyRadiusKm = typeof opts.nearbyRadiusKm === 'number' ? opts.nearbyRadiusKm : NEARBY_RADIUS_KM;
+
+  const cutoff      = isPg ? `(CURRENT_DATE + ${nearExpiryDays})` : `date(CURRENT_DATE, '+${nearExpiryDays} days')`;
+  const daysLeftSQL = isPg ? '(b.expiry_date - CURRENT_DATE)' : 'CAST(julianday(b.expiry_date) - julianday(CURRENT_DATE) AS INTEGER)';
+
+  // 1. Fetch sender pharmacy (need coordinates)
+  const sender = await db.prepare('SELECT id, name, latitude, longitude FROM pharmacies WHERE id = ?').get(pharmacyId);
+  if (!sender) return { created: 0, skippedDuplicate: 0, skippedNoCoordinates: 0, skippedSufficientStock: 0, requests: [] };
+
+  // 2. Find qualifying near-expiry batches at sender
+  const nearExpiryBatches = await db.prepare(`
+    SELECT b.id AS batch_id, b.batch_number, b.quantity, b.expiry_date,
+           ${daysLeftSQL} AS days_until_expiry,
+           m.id AS medicine_id, m.name AS medicine_name, m.generic_name, m.minimum_stock
+    FROM medicine_batches b
+    JOIN medicines m ON m.id = b.medicine_id
+    WHERE m.pharmacy_id = ?
+      AND m.active = 1
+      AND b.quantity > 0
+      AND b.expiry_date >= ${D_TODAY}
+      AND b.expiry_date <= ${cutoff}
+    ORDER BY b.expiry_date ASC
+  `).all(pharmacyId);
+
+  if (nearExpiryBatches.length === 0) {
+    return { created: 0, skippedDuplicate: 0, skippedNoCoordinates: 0, skippedSufficientStock: 0, requests: [] };
+  }
+
+  // 3. Fetch all other pharmacies (potential recipients, with their coordinates)
+  const otherPharmacies = await db.prepare(
+    'SELECT id, name, latitude, longitude FROM pharmacies WHERE id != ?'
+  ).all(pharmacyId);
+
+  let created = 0, skippedDuplicate = 0, skippedNoCoordinates = 0, skippedSufficientStock = 0;
+  const requests = [];
+
+  for (const batch of nearExpiryBatches) {
+    for (const recipient of otherPharmacies) {
+
+      // 4. PROXIMITY CHECK (strict — no fake distances)
+      const sLat = sender.latitude    != null ? Number(sender.latitude)    : null;
+      const sLng = sender.longitude   != null ? Number(sender.longitude)   : null;
+      const rLat = recipient.latitude  != null ? Number(recipient.latitude)  : null;
+      const rLng = recipient.longitude != null ? Number(recipient.longitude) : null;
+
+      if (sLat === null || sLng === null || rLat === null || rLng === null) {
+        skippedNoCoordinates++;
+        continue;
+      }
+
+      const distKm = haversineKm(sLat, sLng, rLat, rLng);
+      if (distKm > nearbyRadiusKm) {
+        skippedNoCoordinates++;
+        continue;
+      }
+
+      // 5. NEED CHECK — find matching medicine at recipient (by lower(name))
+      const recipientMed = await db.prepare(`
+        SELECT m.id, m.minimum_stock,
+               COALESCE((SELECT SUM(b2.quantity) FROM medicine_batches b2
+                         WHERE b2.medicine_id = m.id
+                           AND b2.quantity > 0
+                           AND b2.expiry_date >= ${D_TODAY}), 0) AS current_stock
+        FROM medicines m
+        WHERE m.pharmacy_id = ?
+          AND m.active = 1
+          AND lower(m.name) = lower(?)
+        LIMIT 1
+      `).get(recipient.id, batch.medicine_name);
+
+      if (!recipientMed || Number(recipientMed.minimum_stock) <= 0) { skippedSufficientStock++; continue; }
+      if (Number(recipientMed.current_stock) >= Number(recipientMed.minimum_stock)) { skippedSufficientStock++; continue; }
+
+      // 6. REQUEST QUANTITY — amount needed to reach minimum_stock, bounded by available qty
+      const deficit    = Number(recipientMed.minimum_stock) - Number(recipientMed.current_stock);
+      const requestQty = Math.min(deficit, batch.quantity);
+      if (requestQty <= 0) { skippedSufficientStock++; continue; }
+
+      // 7. Deterministic idempotency key — prevents atomic duplicates via UNIQUE constraint
+      const idemKey = crypto.createHash('sha256')
+        .update(`${pharmacyId}|${recipient.id}|${batch.medicine_id}|${batch.batch_id}`)
+        .digest('hex');
+
+      // 8. Application-level duplicate guard (secondary; DB UNIQUE is authoritative)
+      const existing = await db.prepare(
+        "SELECT id FROM medicine_redistribution_requests WHERE idempotency_key = ? AND status IN ('PENDING','ACCEPTED')"
+      ).get(idemKey);
+      if (existing) { skippedDuplicate++; continue; }
+
+      // 9. Insert request — auto-accepted immediately
+      let requestId;
+      try {
+        const ins = await db.prepare(`
+          INSERT INTO medicine_redistribution_requests
+            (idempotency_key, sender_pharmacy_id, recipient_pharmacy_id, medicine_id,
+             source_batch_id, requested_quantity, reason, request_type, status,
+             automatic_request, automatic_acceptance, days_until_expiry, distance_km)
+          VALUES (?, ?, ?, ?, ?, ?, 'NEAR_EXPIRY_REDISTRIBUTION', 'NEAR_EXPIRY', 'ACCEPTED',
+                  1, 1, ?, ?) RETURNING id
+        `).run(
+          idemKey, pharmacyId, recipient.id, batch.medicine_id,
+          batch.batch_id, requestQty,
+          Number(batch.days_until_expiry),
+          Math.round(distKm * 1000) / 1000
+        );
+        requestId = Number(ins.lastInsertRowid);
+      } catch (err) {
+        // UNIQUE constraint violation = concurrent duplicate — treat as skipped
+        if (isDuplicateError(err)) { skippedDuplicate++; continue; }
+        throw err;
+      }
+
+      created++;
+      requests.push({
+        id: requestId,
+        senderPharmacyId:    pharmacyId,
+        senderName:          sender.name,
+        recipientPharmacyId: recipient.id,
+        recipientName:       recipient.name,
+        medicineId:          batch.medicine_id,
+        medicineName:        batch.medicine_name,
+        batchId:             batch.batch_id,
+        batchNumber:         batch.batch_number,
+        requestedQuantity:   requestQty,
+        daysUntilExpiry:     Number(batch.days_until_expiry),
+        distanceKm:          Math.round(distKm * 1000) / 1000,
+        reason:              'NEAR_EXPIRY_REDISTRIBUTION',
+        requestType:         'NEAR_EXPIRY',
+        status:              'ACCEPTED',
+        automaticRequest:    true,
+        automaticAcceptance: true,
+      });
+    }
+  }
+
+  return { created, skippedDuplicate, skippedNoCoordinates, skippedSufficientStock, requests };
 }
 
 async function handler(req, res) {
@@ -1274,12 +1476,131 @@ async function handler(req, res) {
     }
   }
 
+  // ─── POST /api/inter-pharmacy/near-expiry/process ─────────────────────────
+  // Triggers the near-expiry redistribution scan. Idempotent — safe to re-run.
+  // ADMIN only. Pharmacy derived from session; client cannot supply it.
+  if (req.method === 'POST' && url.pathname === '/api/inter-pharmacy/near-expiry/process') {
+    if (!requireRole(res, user, 'ADMIN')) return;
+    try {
+      const body = await readJson(req);
+      const opts = {};
+      if (body.nearExpiryDays !== undefined) {
+        const d = Number(body.nearExpiryDays);
+        if (!Number.isInteger(d) || d < 1 || d > 365)
+          return json(res, 400, { error: 'nearExpiryDays must be an integer between 1 and 365.' });
+        opts.nearExpiryDays = d;
+      }
+      if (body.nearbyRadiusKm !== undefined) {
+        const r = Number(body.nearbyRadiusKm);
+        if (!Number.isFinite(r) || r <= 0)
+          return json(res, 400, { error: 'nearbyRadiusKm must be a positive number.' });
+        opts.nearbyRadiusKm = r;
+      }
+      const result = await processNearExpiryRedistribution(user.pharmacy_id, opts);
+      return json(res, 200, {
+        ...result,
+        nearExpiryDays: opts.nearExpiryDays ?? NEAR_EXPIRY_DAYS,
+        nearbyRadiusKm: opts.nearbyRadiusKm ?? NEARBY_RADIUS_KM,
+      });
+    } catch (error) { return json(res, 400, { error: error.message }); }
+  }
+
+  // ─── GET /api/inter-pharmacy/requests ─────────────────────────────────────
+  // Lists redistribution requests where the authenticated pharmacy is sender or recipient.
+  if (req.method === 'GET' && url.pathname === '/api/inter-pharmacy/requests') {
+    if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
+    const role   = url.searchParams.get('role')   || 'ALL'; // ALL | SENDER | RECIPIENT
+    const status = url.searchParams.get('status') || 'ALL';
+    const pid = user.pharmacy_id;
+    const rows = await db.prepare(`
+      SELECT r.id, r.idempotency_key,
+             r.sender_pharmacy_id, sp.name AS sender_name,
+             r.recipient_pharmacy_id, rp.name AS recipient_name,
+             r.medicine_id, m.name AS medicine_name, m.generic_name,
+             r.source_batch_id, b.batch_number,
+             r.requested_quantity, r.reason, r.request_type, r.status,
+             r.automatic_request, r.automatic_acceptance,
+             r.days_until_expiry, r.distance_km, r.notes,
+             r.created_at, r.updated_at
+      FROM medicine_redistribution_requests r
+      JOIN pharmacies sp ON sp.id = r.sender_pharmacy_id
+      JOIN pharmacies rp ON rp.id = r.recipient_pharmacy_id
+      JOIN medicines  m  ON m.id  = r.medicine_id
+      JOIN medicine_batches b ON b.id = r.source_batch_id
+      WHERE (
+            (?  = 'ALL'       AND (r.sender_pharmacy_id = ? OR r.recipient_pharmacy_id = ?))
+         OR (? = 'SENDER'    AND r.sender_pharmacy_id    = ?)
+         OR (? = 'RECIPIENT' AND r.recipient_pharmacy_id = ?)
+      )
+      AND (? = 'ALL' OR r.status = ?)
+      ORDER BY r.created_at DESC
+      LIMIT 200
+    `).all(
+      role, pid, pid,
+      role, pid,
+      role, pid,
+      status, status
+    );
+    return json(res, 200, { requests: rows });
+  }
+
+  // ─── POST /api/inter-pharmacy/requests/:id/status ─────────────────────────
+  // Transitions a request status (e.g. ACCEPTED → COMPLETED or CANCELLED).
+  const redistMatch = url.pathname.match(/^\/api\/inter-pharmacy\/requests\/(\d+)\/status$/);
+  if (redistMatch && req.method === 'POST') {
+    if (!requireRole(res, user, 'ADMIN')) return;
+    try {
+      const reqId = Number(redistMatch[1]);
+      const input = await readJson(req);
+      const newStatus = cleanText(input.status, 'status', { required: true, max: 20 });
+      const validTransitions = {
+        PENDING:   ['ACCEPTED', 'REJECTED', 'CANCELLED'],
+        ACCEPTED:  ['COMPLETED', 'CANCELLED'],
+        REJECTED:  [],
+        CANCELLED: [],
+        COMPLETED: [],
+      };
+      // Must belong to authenticated pharmacy (sender or recipient) — tenant isolation
+      const existing = await db.prepare(`
+        SELECT id, status FROM medicine_redistribution_requests
+        WHERE id = ? AND (sender_pharmacy_id = ? OR recipient_pharmacy_id = ?)
+      `).get(reqId, user.pharmacy_id, user.pharmacy_id);
+      if (!existing) return json(res, 404, { error: 'Request not found.' });
+      const allowed = validTransitions[existing.status] || [];
+      if (!allowed.includes(newStatus))
+        return json(res, 409, { error: `Cannot transition from '${existing.status}' to '${newStatus}'.` });
+      await db.prepare(
+        "UPDATE medicine_redistribution_requests SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?"
+      ).run(newStatus, reqId);
+      const updated = await db.prepare(
+        'SELECT * FROM medicine_redistribution_requests WHERE id = ?'
+      ).get(reqId);
+      return json(res, 200, { request: updated });
+    } catch (error) { return json(res, 400, { error: error.message }); }
+  }
+
+  // ─── PUT /api/pharmacies/coordinates ──────────────────────────────────────
+  // Allows ADMIN to set coordinates for their own pharmacy.
+  if (req.method === 'PUT' && url.pathname === '/api/pharmacies/coordinates') {
+    if (!requireRole(res, user, 'ADMIN')) return;
+    try {
+      const input = await readJson(req);
+      const lat = input.latitude  != null ? Number(input.latitude)  : null;
+      const lng = input.longitude != null ? Number(input.longitude) : null;
+      if (lat !== null && (lat < -90  || lat > 90))  return json(res, 400, { error: 'latitude must be between -90 and 90.' });
+      if (lng !== null && (lng < -180 || lng > 180)) return json(res, 400, { error: 'longitude must be between -180 and 180.' });
+      await db.prepare('UPDATE pharmacies SET latitude=?, longitude=? WHERE id=?').run(lat, lng, user.pharmacy_id);
+      const ph = await db.prepare('SELECT id, name, address, latitude, longitude FROM pharmacies WHERE id=?').get(user.pharmacy_id);
+      return json(res, 200, { pharmacy: ph });
+    } catch (error) { return json(res, 400, { error: error.message }); }
+  }
+
   if (url.pathname.startsWith('/api/')) return json(res, 404, { error: 'API endpoint not found.' });
   if (!serveFile(res, url.pathname)) json(res, 404, { error: 'Not found.' });
 }
 
 const server = http.createServer((req, res) => handler(req, res).catch(error => { console.error(error); json(res, 500, { error: 'Internal server error.' }); }));
-module.exports = { server, handler, passwordHash, passwordMatches, hashDeviceToken, hashSessionToken, currentDevice, currentUser, db, adapter, SESSION_TTL_MS };
+module.exports = { server, handler, passwordHash, passwordMatches, hashDeviceToken, hashSessionToken, currentDevice, currentUser, db, adapter, SESSION_TTL_MS, processNearExpiryRedistribution, haversineKm, NEAR_EXPIRY_DAYS, NEARBY_RADIUS_KM };
 
 if (require.main === module) {
   server.listen(PORT, () => console.log(`MediIndex API running on http://localhost:${PORT}`));

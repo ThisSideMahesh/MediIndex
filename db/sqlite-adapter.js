@@ -130,6 +130,31 @@ class SQLiteAdapter {
       );
       CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+      CREATE TABLE IF NOT EXISTS medicine_redistribution_requests (
+        id                    INTEGER PRIMARY KEY,
+        idempotency_key       TEXT NOT NULL UNIQUE,
+        sender_pharmacy_id    INTEGER NOT NULL REFERENCES pharmacies(id),
+        recipient_pharmacy_id INTEGER NOT NULL REFERENCES pharmacies(id),
+        medicine_id           INTEGER NOT NULL REFERENCES medicines(id),
+        source_batch_id       INTEGER NOT NULL REFERENCES medicine_batches(id),
+        requested_quantity    INTEGER NOT NULL CHECK(requested_quantity > 0),
+        reason                TEXT NOT NULL DEFAULT 'NEAR_EXPIRY_REDISTRIBUTION',
+        request_type          TEXT NOT NULL DEFAULT 'NEAR_EXPIRY'
+                                CHECK(request_type IN ('NEAR_EXPIRY', 'MANUAL')),
+        status                TEXT NOT NULL DEFAULT 'PENDING'
+                                CHECK(status IN ('PENDING', 'ACCEPTED', 'REJECTED', 'CANCELLED', 'COMPLETED')),
+        automatic_request     INTEGER NOT NULL DEFAULT 0,
+        automatic_acceptance  INTEGER NOT NULL DEFAULT 0,
+        days_until_expiry     INTEGER,
+        distance_km           REAL,
+        notes                 TEXT,
+        created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_redistrib_sender    ON medicine_redistribution_requests(sender_pharmacy_id);
+      CREATE INDEX IF NOT EXISTS idx_redistrib_recipient ON medicine_redistribution_requests(recipient_pharmacy_id);
+      CREATE INDEX IF NOT EXISTS idx_redistrib_batch     ON medicine_redistribution_requests(source_batch_id);
+      CREATE INDEX IF NOT EXISTS idx_redistrib_status    ON medicine_redistribution_requests(status);
     `);
   }
 
@@ -143,6 +168,43 @@ class SQLiteAdapter {
       if (!cols.includes('customer_name')) this.db.exec('ALTER TABLE sales ADD COLUMN customer_name TEXT');
       if (!cols.includes('customer_phone')) this.db.exec('ALTER TABLE sales ADD COLUMN customer_phone TEXT');
       if (!cols.includes('payment_method')) this.db.exec("ALTER TABLE sales ADD COLUMN payment_method TEXT NOT NULL DEFAULT 'CASH'");
+
+      // Add geographic coordinates to pharmacies (nullable — existing rows keep NULL)
+      const pharmCols = this.db.prepare('PRAGMA table_info(pharmacies)').all().map(c => c.name);
+      if (!pharmCols.includes('latitude'))  this.db.exec('ALTER TABLE pharmacies ADD COLUMN latitude  REAL');
+      if (!pharmCols.includes('longitude')) this.db.exec('ALTER TABLE pharmacies ADD COLUMN longitude REAL');
+
+      // Medicine redistribution requests table (additive — safe for existing DBs)
+      const tables = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(t => t.name);
+      if (!tables.includes('medicine_redistribution_requests')) {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS medicine_redistribution_requests (
+            id                    INTEGER PRIMARY KEY,
+            idempotency_key       TEXT NOT NULL UNIQUE,
+            sender_pharmacy_id    INTEGER NOT NULL REFERENCES pharmacies(id),
+            recipient_pharmacy_id INTEGER NOT NULL REFERENCES pharmacies(id),
+            medicine_id           INTEGER NOT NULL REFERENCES medicines(id),
+            source_batch_id       INTEGER NOT NULL REFERENCES medicine_batches(id),
+            requested_quantity    INTEGER NOT NULL CHECK(requested_quantity > 0),
+            reason                TEXT NOT NULL DEFAULT 'NEAR_EXPIRY_REDISTRIBUTION',
+            request_type          TEXT NOT NULL DEFAULT 'NEAR_EXPIRY'
+                                    CHECK(request_type IN ('NEAR_EXPIRY', 'MANUAL')),
+            status                TEXT NOT NULL DEFAULT 'PENDING'
+                                    CHECK(status IN ('PENDING', 'ACCEPTED', 'REJECTED', 'CANCELLED', 'COMPLETED')),
+            automatic_request     INTEGER NOT NULL DEFAULT 0,
+            automatic_acceptance  INTEGER NOT NULL DEFAULT 0,
+            days_until_expiry     INTEGER,
+            distance_km           REAL,
+            notes                 TEXT,
+            created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+          );
+          CREATE INDEX IF NOT EXISTS idx_redistrib_sender    ON medicine_redistribution_requests(sender_pharmacy_id);
+          CREATE INDEX IF NOT EXISTS idx_redistrib_recipient ON medicine_redistribution_requests(recipient_pharmacy_id);
+          CREATE INDEX IF NOT EXISTS idx_redistrib_batch     ON medicine_redistribution_requests(source_batch_id);
+          CREATE INDEX IF NOT EXISTS idx_redistrib_status    ON medicine_redistribution_requests(status);
+        `);
+      }
     } catch {}
   }
 

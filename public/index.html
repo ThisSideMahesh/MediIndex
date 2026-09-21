@@ -9,7 +9,7 @@
     </section>
     <section id="app-view" hidden>
       <header><div class="brand-row"><img class="header-logo" src="/assets/mediindex-logo.png" alt="MediIndex"><div><p class="eyebrow">OFFLINE-READY LOCAL SYSTEM</p><h1>MediIndex <span>Dashboard</span></h1></div></div><div class="user"><span id="user-name"></span><div id="sync-status" class="sync-status" title="Synchronization status" hidden><span id="sync-icon" class="sync-icon">●</span><span id="sync-label">Online</span><span id="sync-pending" class="sync-pending" hidden></span></div><button id="logout" class="secondary">Logout</button></div></header>
-      <nav aria-label="Main navigation"><button class="nav active" data-view="dashboard">Dashboard</button><button class="nav" data-view="inventory">Medicines &amp; inventory</button><button class="nav" data-view="billing">Billing &amp; POS</button><button class="nav" data-view="analytics">Demand Forecasting</button><button class="nav" data-view="store-map">Store Layout (2D)</button><button class="nav" data-view="expiry">Expiry alerts</button></nav>
+      <nav aria-label="Main navigation"><button class="nav active" data-view="dashboard">Dashboard</button><button class="nav" data-view="inventory">Medicines &amp; inventory</button><button class="nav" data-view="billing">Billing &amp; POS</button><button class="nav" data-view="analytics">Demand Forecasting</button><button class="nav" data-view="store-map">Store Layout (2D)</button><button class="nav" data-view="expiry">Expiry alerts</button><button class="nav admin-only-nav" data-view="redistribution" hidden>Near-Expiry Redistribution</button></nav>
       <p class="demo-note">DEMO / SYNTHETIC DATA - values are calculated from the local SQLite database.</p>
       <section id="dashboard-view"><div class="grid" id="metrics"></div><section class="panel"><h2>Foundation status</h2><ul><li><strong>Database:</strong> SQLite is connected and persisted locally.</li><li><strong>Authentication:</strong> password hashes, expiring server sessions and protected API routes are active.</li><li><strong>Inventory &amp; Billing:</strong> catalogue management, multi-batch stock, and transactional FEFO billing are active.</li><li><strong>Forecasting Engine:</strong> 3-period Weighted Moving Average (WMA) with hard reliability guardrails.</li><li><strong>Store Layout:</strong> 2D interactive floor plan visualizer for rapid medicine localization.</li></ul></section></section>
       <section id="inventory-view" hidden>
@@ -391,6 +391,33 @@
         <div class="section-heading"><div><p class="eyebrow">BATCH-LEVEL ALERTS</p><h2>Expiry alerts</h2></div><button id="refresh-alerts" class="secondary">Refresh alerts</button></div>
         <div class="filter-row"><label>Type<select id="alert-status"><option value="ALL">All alerts</option><option value="EXPIRED">Expired</option><option value="EXPIRING_SOON">Expiring within 30 days</option></select></label><label>State<select id="alert-ack"><option value="0">Unacknowledged</option><option value="ALL">All states</option><option value="1">Acknowledged</option></select></label></div>
         <p id="alert-error" class="error" role="alert"></p><div id="alert-list" class="alert-list"></div>
+      </section>
+      <section id="redistribution-view" hidden>
+        <div class="section-heading">
+          <div><p class="eyebrow">ADMIN · AUTOMATIC NEAR-EXPIRY REDISTRIBUTION</p><h2>Near-Expiry Redistribution</h2></div>
+          <button id="run-redistribution-btn">Run Near-Expiry Scan</button>
+        </div>
+        <p class="muted" style="margin-bottom:1rem">Automatically detects medicine batches expiring within <strong id="near-expiry-days-label">20</strong> days and creates redistribution requests to nearby pharmacies (within radius) that have a confirmed stock shortage. Proximity requires pharmacy coordinates — see Settings. No inventory is transferred automatically.</p>
+        <div id="redistribution-scan-result" hidden></div>
+        <div class="section-heading" style="margin-top:2rem">
+          <div><p class="eyebrow">REQUEST HISTORY</p><h3>Redistribution Requests</h3></div>
+          <button id="refresh-redistribution-btn" class="secondary">Refresh</button>
+        </div>
+        <div class="filter-row">
+          <label>Role<select id="redistrib-role-filter"><option value="ALL">All (sender &amp; recipient)</option><option value="SENDER">Outgoing (I am sender)</option><option value="RECIPIENT">Incoming (I am recipient)</option></select></label>
+          <label>Status<select id="redistrib-status-filter"><option value="ALL">All statuses</option><option value="PENDING">Pending</option><option value="ACCEPTED">Accepted</option><option value="COMPLETED">Completed</option><option value="CANCELLED">Cancelled</option><option value="REJECTED">Rejected</option></select></label>
+        </div>
+        <p id="redistribution-error" class="error" role="alert"></p>
+        <div class="table-responsive">
+          <table class="pos-table" id="redistribution-table">
+            <thead>
+              <tr><th>ID</th><th>Medicine</th><th>Batch</th><th>Sender</th><th>Recipient</th><th>Qty</th><th>Days Left</th><th>Dist (km)</th><th>Status</th><th>Auto?</th><th>Created</th><th>Action</th></tr>
+            </thead>
+            <tbody id="redistribution-body">
+              <tr><td colspan="12" class="muted text-center">Run a scan or refresh to view requests.</td></tr>
+            </tbody>
+          </table>
+        </div>
       </section>
     </section>
   </main>

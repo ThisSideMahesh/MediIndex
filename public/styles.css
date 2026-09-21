@@ -1323,3 +1323,32 @@ dialog form {
   color: var(--danger);
 }
 .sync-status.is-failed .sync-icon { color: var(--danger); }
+
+/* ============================================================
+   NEAR-EXPIRY REDISTRIBUTION
+   ============================================================ */
+
+.redistrib-scan-result {
+  padding: 14px 18px;
+  border-radius: 10px;
+  border-left: 5px solid #16a34a;
+  background: var(--success-bg);
+  color: var(--success-text);
+  font-size: 0.9rem;
+  margin-bottom: 18px;
+}
+.redistrib-scan-result.no-action {
+  border-left-color: var(--muted);
+  background: #f8fafc;
+  color: var(--muted);
+}
+.badge-auto {
+  background: #eff6ff; color: #1d4ed8;
+  border: 1px solid #bfdbfe;
+  border-radius: 999px; padding: 2px 7px;
+  font-size: 0.7rem; font-weight: 800;
+}
+.badge-accepted  { background: var(--success-bg); color: var(--success-text); }
+.badge-pending   { background: var(--warning-bg); color: var(--warning-text); }
+.badge-rejected, .badge-cancelled { background: #e2e8f0; color: #475569; }
+.badge-completed { background: #eff6ff; color: #1d4ed8; }
