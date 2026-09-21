@@ -22,8 +22,36 @@ const formatValue = (key, value) => key === 'todaySales' ? formatCurrency(value)
 
 async function api(path, options) {
   const response = await fetch(path, options);
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || 'Request failed');
+
+  // Read the body as text first — never assume it's JSON. A non-2xx response
+  // from an auth gateway, a Vercel error page, or an unhandled crash can return
+  // HTML or plain text, and calling response.json() directly on that throws a
+  // misleading "Unexpected token..." parse error instead of a useful message.
+  const raw = await response.text();
+  const contentType = response.headers.get('content-type') || '';
+  const looksLikeJson = contentType.includes('application/json');
+
+  let data = null;
+  if (looksLikeJson && raw) {
+    try { data = JSON.parse(raw); } catch { data = null; }
+  }
+
+  if (!response.ok) {
+    // Prefer the server's own error message when we successfully parsed JSON.
+    if (data && typeof data.error === 'string' && data.error) throw new Error(data.error);
+    if (response.status === 401) throw new Error('Your session has expired. Please sign in again.');
+    if (response.status === 403) throw new Error('You do not have permission for this action.');
+    if (response.status === 404) throw new Error('The requested resource was not found.');
+    if (response.status >= 500) throw new Error('The server is temporarily unavailable. Please try again.');
+    throw new Error(`Request failed (HTTP ${response.status}).`);
+  }
+
+  // Success status but the body wasn't parseable JSON — never expose raw
+  // HTML/text to the user; fail with a clear, generic message instead.
+  if (!looksLikeJson || data === null) {
+    throw new Error('The server returned an unexpected response.');
+  }
+
   return data;
 }
 
