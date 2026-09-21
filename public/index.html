@@ -8,7 +8,7 @@
       <p class="hint">Demo credentials are prefilled for this local development build.</p>
     </section>
     <section id="app-view" hidden>
-      <header><div class="brand-row"><img class="header-logo" src="/assets/mediindex-logo.png" alt="MediIndex"><div><p class="eyebrow">OFFLINE-READY LOCAL SYSTEM</p><h1>MediIndex <span>Dashboard</span></h1></div></div><div class="user"><span id="user-name"></span><button id="logout" class="secondary">Logout</button></div></header>
+      <header><div class="brand-row"><img class="header-logo" src="/assets/mediindex-logo.png" alt="MediIndex"><div><p class="eyebrow">OFFLINE-READY LOCAL SYSTEM</p><h1>MediIndex <span>Dashboard</span></h1></div></div><div class="user"><span id="user-name"></span><div id="sync-status" class="sync-status" title="Synchronization status" hidden><span id="sync-icon" class="sync-icon">●</span><span id="sync-label">Online</span><span id="sync-pending" class="sync-pending" hidden></span></div><button id="logout" class="secondary">Logout</button></div></header>
       <nav aria-label="Main navigation"><button class="nav active" data-view="dashboard">Dashboard</button><button class="nav" data-view="inventory">Medicines &amp; inventory</button><button class="nav" data-view="billing">Billing &amp; POS</button><button class="nav" data-view="analytics">Demand Forecasting</button><button class="nav" data-view="store-map">Store Layout (2D)</button><button class="nav" data-view="expiry">Expiry alerts</button></nav>
       <p class="demo-note">DEMO / SYNTHETIC DATA - values are calculated from the local SQLite database.</p>
       <section id="dashboard-view"><div class="grid" id="metrics"></div><section class="panel"><h2>Foundation status</h2><ul><li><strong>Database:</strong> SQLite is connected and persisted locally.</li><li><strong>Authentication:</strong> password hashes, expiring server sessions and protected API routes are active.</li><li><strong>Inventory &amp; Billing:</strong> catalogue management, multi-batch stock, and transactional FEFO billing are active.</li><li><strong>Forecasting Engine:</strong> 3-period Weighted Moving Average (WMA) with hard reliability guardrails.</li><li><strong>Store Layout:</strong> 2D interactive floor plan visualizer for rapid medicine localization.</li></ul></section></section>
@@ -533,5 +533,6 @@
     </div>
   </dialog>
   <script src="/qr-generator.js"></script>
+  <script src="/sync.js"></script>
   <script src="/app.js"></script>
 </body></html>

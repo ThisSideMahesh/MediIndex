@@ -57,6 +57,56 @@ async function showApp(user) {
   await refreshDashboard();
   loginView.hidden = true;
   appView.hidden = false;
+
+  // Initialise client-side sync module
+  if (window.MediSync) {
+    document.querySelector('#sync-status').hidden = false;
+    await window.MediSync.init(({ status, pending, failed }) => {
+      const el = document.querySelector('#sync-status');
+      const icon = document.querySelector('#sync-icon');
+      const label = document.querySelector('#sync-label');
+      const pendingEl = document.querySelector('#sync-pending');
+
+      // Remove all state classes
+      el.classList.remove('is-online', 'is-offline', 'is-syncing', 'is-synced', 'is-failed');
+
+      switch (status) {
+        case 'online':
+          el.classList.add('is-online');
+          icon.textContent = '●';
+          label.textContent = 'Online';
+          pendingEl.hidden = true;
+          break;
+        case 'offline':
+          el.classList.add('is-offline');
+          icon.textContent = '◌';
+          label.textContent = pending > 0 ? 'Offline — changes will sync automatically' : 'Offline';
+          if (pending > 0) { pendingEl.textContent = `${pending} pending`; pendingEl.hidden = false; }
+          else pendingEl.hidden = true;
+          break;
+        case 'syncing':
+          el.classList.add('is-syncing');
+          icon.textContent = '↻';
+          label.textContent = `Syncing${pending > 0 ? ` ${pending} change${pending === 1 ? '' : 's'}` : ''}…`;
+          pendingEl.hidden = true;
+          break;
+        case 'synced':
+          el.classList.add('is-synced');
+          icon.textContent = '✓';
+          label.textContent = 'Synced';
+          pendingEl.hidden = true;
+          break;
+        case 'failed':
+          el.classList.add('is-failed');
+          icon.textContent = '✕';
+          label.textContent = `Sync failed`;
+          const cnt = (pending || 0) + (failed || 0);
+          if (cnt > 0) { pendingEl.textContent = `${cnt} pending`; pendingEl.hidden = false; }
+          else pendingEl.hidden = true;
+          break;
+      }
+    });
+  }
 }
 
 function switchView(view) {
@@ -349,6 +399,15 @@ async function handleCheckout(event) {
   const errorEl = document.querySelector('#pos-checkout-error');
   const submitBtn = document.querySelector('#pos-checkout-btn');
   errorEl.textContent = '';
+
+  // POS/billing is intentionally online-only — FEFO requires live server inventory
+  if (window.MediSync) {
+    const { status } = window.MediSync.getStatus();
+    if (status === 'offline') {
+      errorEl.textContent = 'This operation requires an Internet connection. Billing and sales cannot be processed offline.';
+      return;
+    }
+  }
 
   if (billingCart.length === 0) {
     errorEl.textContent = 'Cart is empty.';
@@ -1128,7 +1187,7 @@ document.querySelector('#medicine-form').addEventListener('submit', async event 
 
 document.querySelector('#batch-form').addEventListener('submit', async event => {
   event.preventDefault();
-  const id = document.querySelector('#batch-medicine-id').value;
+  const medicineId = document.querySelector('#batch-medicine-id').value;
   const body = {
     batchNumber: document.querySelector('#batch-number').value,
     quantity: document.querySelector('#batch-quantity').value,
@@ -1138,8 +1197,24 @@ document.querySelector('#batch-form').addEventListener('submit', async event => 
     expiryDate: document.querySelector('#batch-expiry').value,
     location: document.querySelector('#batch-location').value
   };
+  const errorEl = document.querySelector('#batch-form-error');
+  errorEl.textContent = '';
+
+  // --- Offline guard: creating a new batch requires an Internet connection.
+  // The offline /api/sync/stock-receipt endpoint handles ADDITIONS to an existing batch,
+  // not new batch creation (which requires selling price, expiry date, location, etc.).
+  // Show a clear message rather than queuing a doomed operation.
+  if (window.MediSync) {
+    const { status } = window.MediSync.getStatus();
+    if (status === 'offline') {
+      errorEl.textContent = 'Adding a new batch requires an Internet connection. Please reconnect and try again.';
+      return;
+    }
+  }
+
+  // Online: use the existing batch-creation endpoint
   try {
-    await api(`/api/medicines/${id}/batches`, {
+    await api(`/api/medicines/${medicineId}/batches`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
@@ -1148,7 +1223,7 @@ document.querySelector('#batch-form').addEventListener('submit', async event => 
     await loadMedicines();
     await refreshDashboard();
   } catch (error) {
-    document.querySelector('#batch-form-error').textContent = error.message;
+    errorEl.textContent = error.message;
   }
 });
 

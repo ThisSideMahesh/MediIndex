@@ -1157,6 +1157,123 @@ async function handler(req, res) {
     } catch (error) { return json(res, 400, { error: error.message }); }
   }
 
+  // ─── POST /api/sync/stock-receipt ─────────────────────────────────────────
+  // Browser-session-authenticated stock receipt with idempotency.
+  // Equivalent to processMobileStockEntry but authenticated via browser session
+  // (cookie) rather than a paired device token.  Pharmacy and user are derived
+  // authoritatively from the session — the client never supplies them.
+  if (req.method === 'POST' && url.pathname === '/api/sync/stock-receipt') {
+    if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
+    try {
+      const input = await readJson(req);
+
+      // Reject any attempt to spoof pharmacy context
+      if (input.pharmacyId !== undefined || input.pharmacy_id !== undefined) {
+        return json(res, 400, { error: 'Client must not supply pharmacy_id. Pharmacy context is derived from the authenticated session.' });
+      }
+
+      const medicineId = Number(input.medicineId);
+      if (!Number.isInteger(medicineId) || medicineId <= 0) return json(res, 400, { error: 'Invalid medicine ID.' });
+
+      const batchNumber = cleanText(input.batchNumber, 'Batch number', { required: true, max: 80 });
+      const quantity = Number(input.quantity);
+      if (!Number.isInteger(quantity) || quantity <= 0) return json(res, 400, { error: 'Quantity must be a positive whole number.' });
+      if (quantity > 100000) return json(res, 400, { error: 'Quantity exceeds maximum allowable limit of 100,000 units.' });
+
+      const idempotencyKey = cleanText(input.idempotencyKey, 'Idempotency key', { required: true, max: 120 });
+
+      // Stable request hash — same inputs always produce the same hash
+      const requestHash = crypto.createHash('sha256').update(JSON.stringify({
+        medicineId,
+        batchNumber: batchNumber.trim(),
+        quantity
+      })).digest('hex');
+
+      // Pre-check idempotency (outside transaction — fast path for retries)
+      const existingKey = await db.prepare(
+        'SELECT request_hash, response_status, response_body FROM idempotency_keys WHERE key = ? AND pharmacy_id = ?'
+      ).get(idempotencyKey, user.pharmacy_id);
+
+      if (existingKey) {
+        if (existingKey.request_hash !== requestHash) {
+          return json(res, 409, { error: 'Idempotency key conflict: same key was previously used with a different payload.' });
+        }
+        const cached = JSON.parse(existingKey.response_body);
+        cached.idempotent = true;
+        return json(res, 200, { ...cached, idempotent: true, status: 'IDEMPOTENT' });
+      }
+
+      // Execute inside a transaction
+      const result = await db.transaction(async (client) => {
+        // Double-check under lock (handles concurrent retries)
+        const lockedKey = await client.get(
+          'SELECT request_hash, response_body FROM idempotency_keys WHERE key = ? AND pharmacy_id = ?',
+          [idempotencyKey, user.pharmacy_id]
+        );
+        if (lockedKey) {
+          if (lockedKey.request_hash !== requestHash) {
+            return { conflict: true };
+          }
+          const cached = JSON.parse(lockedKey.response_body);
+          cached.idempotent = true;
+          return { idempotent: true, data: cached };
+        }
+
+        const medicine = await client.get(
+          'SELECT id, name, generic_name, category FROM medicines WHERE id = ? AND pharmacy_id = ? AND active = 1',
+          [medicineId, user.pharmacy_id]
+        );
+        if (!medicine) return { notFound: true, error: `Active medicine ID ${medicineId} not found for this pharmacy.` };
+
+        const batch = await client.get(
+          'SELECT id, batch_number, quantity, selling_price, expiry_date, location FROM medicine_batches WHERE medicine_id = ? AND batch_number = ?',
+          [medicine.id, batchNumber]
+        );
+        if (!batch) return { notFound: true, error: `Batch '${batchNumber}' not found for medicine '${medicine.name}'.` };
+
+        await client.run('UPDATE medicine_batches SET quantity = quantity + ? WHERE id = ?', [quantity, batch.id]);
+
+        const movementRes = await client.run(
+          "INSERT INTO inventory_movements (batch_id, change_quantity, reason, created_by) VALUES (?, ?, 'RECEIPT', ?) RETURNING id",
+          [batch.id, quantity, user.id]
+        );
+        const movementId = Number(movementRes.lastInsertRowid);
+        const newStock = batch.quantity + quantity;
+
+        const responseData = {
+          success: true,
+          status: 'SYNCED',
+          idempotent: false,
+          medicine: { id: medicine.id, name: medicine.name, genericName: medicine.generic_name, category: medicine.category },
+          batch: { id: batch.id, batchNumber: batch.batch_number, quantityAdded: quantity, currentStock: newStock, expiryDate: batch.expiry_date, sellingPrice: batch.selling_price, location: batch.location },
+          movementId,
+          userId: user.id,
+          timestamp: new Date().toISOString()
+        };
+
+        // Record idempotency key (device_id = NULL for browser-session receipts)
+        await client.run(
+          `INSERT INTO idempotency_keys (key, pharmacy_id, device_id, endpoint, request_hash, response_status, response_body)
+           VALUES (?, ?, NULL, '/api/sync/stock-receipt', ?, 200, ?)`,
+          [idempotencyKey, user.pharmacy_id, requestHash, JSON.stringify(responseData)]
+        );
+
+        await refreshExpiryAlerts(user.pharmacy_id);
+        return { ok: true, data: responseData };
+      });
+
+      if (result.conflict) return json(res, 409, { error: 'Idempotency key conflict: same key was previously used with a different payload.' });
+      if (result.notFound) return json(res, 404, { error: result.error });
+      if (result.idempotent) return json(res, 200, result.data);
+      return json(res, 200, result.data);
+    } catch (error) {
+      if (isDuplicateError(error) && (error.message || '').includes('idempotency_keys')) {
+        return json(res, 409, { error: 'Idempotency key conflict.' });
+      }
+      return json(res, 400, { error: error.message });
+    }
+  }
+
   if (url.pathname.startsWith('/api/')) return json(res, 404, { error: 'API endpoint not found.' });
   if (!serveFile(res, url.pathname)) json(res, 404, { error: 'Not found.' });
 }

@@ -1245,3 +1245,81 @@ dialog form {
     grid-template-columns: repeat(3, 1fr);
   }
 }
+
+/* ============================================================
+   SYNC STATUS INDICATOR
+   ============================================================ */
+
+.sync-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  border: 1px solid var(--line);
+  background: #f8fafc;
+  white-space: nowrap;
+  transition: background 0.2s, border-color 0.2s;
+}
+
+.sync-icon {
+  font-size: 0.65rem;
+  line-height: 1;
+}
+
+.sync-pending {
+  background: #e2e8f0;
+  color: #475569;
+  padding: 1px 5px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 800;
+}
+
+/* State: online */
+.sync-status.is-online {
+  background: var(--success-bg);
+  border-color: #4ade80;
+  color: var(--success-text);
+}
+.sync-status.is-online .sync-icon { color: #16a34a; }
+
+/* State: offline */
+.sync-status.is-offline {
+  background: var(--warning-bg);
+  border-color: #f59e0b;
+  color: var(--warning-text);
+}
+.sync-status.is-offline .sync-icon { color: #d97706; }
+
+/* State: syncing */
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.sync-status.is-syncing {
+  background: #eff6ff;
+  border-color: #60a5fa;
+  color: #1d4ed8;
+}
+.sync-status.is-syncing .sync-icon {
+  color: #3b82f6;
+  animation: spin 1s linear infinite;
+  display: inline-block;
+}
+
+/* State: synced */
+.sync-status.is-synced {
+  background: var(--success-bg);
+  border-color: #4ade80;
+  color: var(--success-text);
+}
+.sync-status.is-synced .sync-icon { color: #16a34a; }
+
+/* State: failed */
+.sync-status.is-failed {
+  background: var(--danger-bg);
+  border-color: #f87171;
+  color: var(--danger);
+}
+.sync-status.is-failed .sync-icon { color: var(--danger); }
