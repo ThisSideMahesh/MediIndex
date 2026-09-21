@@ -498,6 +498,104 @@ test('UI-062: create form validates client-side and guards duplicate submission'
 
 test('UI-063: cancellation asks for confirmation', () => {
   assert.match(APP_JS, /window\.confirm\('Cancel this medicine request\?/);
+  // The mandatory confirmation must gate the API call: an early return on
+  // dismissal appears before the cancel POST.
+  const fn = APP_JS.slice(APP_JS.indexOf('async function mreqCancel'));
+  const confirmIdx = fn.indexOf('window.confirm');
+  const postIdx = fn.indexOf('/cancel`');
+  assert.ok(confirmIdx > -1 && postIdx > -1 && confirmIdx < postIdx,
+    'the confirmation must precede the cancel API call');
+  assert.match(fn.slice(0, postIdx), /if \(!window\.confirm[\s\S]*?\) return;/,
+    'dismissing the confirmation must return before any request is sent');
+});
+
+// ── Cancel Request action in the requester detail modal (the reported bug) ──
+
+test('UI-063a: mreqCanCancel is true only for the requester on an active request', () => {
+  const s = ui();
+  // Requester + active states → cancellable
+  assert.equal(s.mreqCanCancel('OPEN', true), true);
+  assert.equal(s.mreqCanCancel('PARTIALLY_COVERED', true), true);
+  // Requester + terminal/covered states → not cancellable (per approved UI rules)
+  for (const st of ['FULLY_COVERED', 'NO_COVERAGE', 'CANCELLED', 'EXPIRED']) {
+    assert.equal(s.mreqCanCancel(st, true), false, `${st} must not be cancellable from the UI`);
+  }
+  // Non-requester → never cancellable, whatever the status
+  for (const st of ['OPEN', 'PARTIALLY_COVERED', 'FULLY_COVERED']) {
+    assert.equal(s.mreqCanCancel(st, false), false, `a non-requester must not get cancel for ${st}`);
+  }
+});
+
+test('UI-063b: the detail modal shows a Cancel Request action for a cancellable own request', () => {
+  // The detail modal builds its action row from mreqCanCancel + viewerRole.
+  // Reproduce the exact expression the modal uses and assert the button appears.
+  const s = ui();
+  const build = (status, viewerRole) => {
+    const isRequester = viewerRole === 'REQUESTER';
+    const canCancel = s.mreqCanCancel(status, isRequester);
+    return canCancel
+      ? `<button type="button" class="danger" data-mreq-cancel="9">Cancel Request</button>`
+      : '';
+  };
+  assert.match(build('OPEN', 'REQUESTER'), /data-mreq-cancel="9"/);
+  assert.match(build('OPEN', 'REQUESTER'), /Cancel Request/);
+  assert.match(build('PARTIALLY_COVERED', 'REQUESTER'), /data-mreq-cancel/);
+  // The source wires the modal action row through mreqCanCancel and labels it "Cancel Request".
+  const modalSrc = APP_JS.slice(APP_JS.indexOf('openMedicineRequestDetail'));
+  assert.match(modalSrc, /const canCancel = mreqCanCancel\(r\.status, isRequester\)/,
+    'the modal must derive cancellability from the shared helper');
+  assert.match(modalSrc, /data-mreq-cancel="\$\{r\.id\}">Cancel Request/,
+    'the modal must render a Cancel Request button in its action row');
+  assert.match(modalSrc, /data-close="mreq-detail-dialog">Close/,
+    'Close must remain in the same action row');
+});
+
+test('UI-063c: a non-requester viewing the request gets no cancel action in the modal', () => {
+  const s = ui();
+  const isRequester = false; // viewerRole === 'RECIPIENT'
+  assert.equal(s.mreqCanCancel('OPEN', isRequester), false);
+  assert.equal(s.mreqCanCancel('PARTIALLY_COVERED', isRequester), false);
+});
+
+test('UI-063d: CANCELLED, EXPIRED and FULLY_COVERED requests show no cancel action anywhere', () => {
+  const s = ui();
+  for (const status of ['CANCELLED', 'EXPIRED', 'FULLY_COVERED', 'NO_COVERAGE']) {
+    // My Requests card
+    assert.doesNotMatch(s.mreqMyCard(sampleRequest({ status })), /data-mreq-cancel/,
+      `the ${status} card must not offer cancel`);
+    // Modal helper
+    assert.equal(s.mreqCanCancel(status, true), false, `the ${status} modal must not offer cancel`);
+  }
+});
+
+test('UI-063e: duplicate cancellation is prevented while one is in flight', () => {
+  // mreqCancel runs through mreqRunAction, which is guarded by the mreqBusy flag
+  // and disables the button until the request settles.
+  const fn = APP_JS.slice(APP_JS.indexOf('async function mreqCancel'), APP_JS.indexOf('async function mreqCancel') + 900);
+  assert.match(fn, /mreqRunAction\(button/, 'cancel must run through the shared action guard');
+  const guard = APP_JS.slice(APP_JS.indexOf('async function mreqRunAction'), APP_JS.indexOf('async function mreqRunAction') + 500);
+  assert.match(guard, /if \(mreqBusy\) return/, 'a second submission must be ignored while busy');
+  assert.match(guard, /button\.disabled = true/, 'the button must be disabled while working');
+});
+
+test('UI-063f: cancel never sends client pharmacy identity and uses the existing helper', () => {
+  const fn = APP_JS.slice(APP_JS.indexOf('async function mreqCancel'), APP_JS.indexOf('async function mreqCancel') + 900);
+  assert.match(fn, /\$\{MREQ_API\}\/\$\{requestId\}\/cancel/, 'the correct cancel endpoint is used');
+  assert.match(fn, /JSON\.stringify\(\{\}\)/, 'the cancel body carries no pharmacy id');
+  assert.doesNotMatch(fn, /pharmacyId|pharmacy_id|requesterPharmacyId/, 'no client pharmacy identity may be sent');
+  assert.match(fn, /api\(/, 'the existing api() helper must be used');
+});
+
+test('UI-063g: a failed cancellation shows an error and never claims success', () => {
+  const start = APP_JS.indexOf('async function mreqCancel');
+  const fn = APP_JS.slice(start, APP_JS.indexOf('\n}\n', start) + 2);
+  // On error the message is surfaced and no success/close path runs in the catch.
+  assert.match(fn, /catch \(err\) \{[\s\S]*mreqSetError\(err\.message\)/,
+    'a failure must surface the error message');
+  assert.match(fn, /detailError[\s\S]*err\.message/, 'the modal error area must show the failure');
+  const catchBlock = fn.slice(fn.indexOf('catch (err)'));
+  assert.doesNotMatch(catchBlock, /CANCELLED|closeDialog/,
+    'the failure path must not claim success or close as if cancelled');
 });
 
 test('UI-064: offline is surfaced and requests are never queued for sync', () => {
@@ -673,6 +771,69 @@ forEachDb(test, 'UI-102: offer, decline and cancel responses match what the UI r
   assert.equal(after.totalUnits, before.totalUnits);
   assert.equal(after.movements, before.movements);
   assert.equal(after.movements, 0);
+});
+
+forEachDb(test, 'UI-106: cancel succeeds, flips status to CANCELLED, and disables further cancel', async (h) => {
+  await setupRequester(h);
+  const b = await addTenant(h, 'Pharmacy B', COORDS.near, { stock: 80 });
+  const reqCookie = await login(h, 'staff@mediindex.local');
+  const before = await inventorySnapshot(h);
+  const id = (await createRequest(h, reqCookie, { requestedQuantity: 50 })).body.request.id;
+
+  const s = ui();
+
+  // Before cancel: the requester detail view offers the action.
+  const openDetail = await h.request({ method: 'GET', url: `/api/inter-pharmacy/medicine-requests/${id}`, cookie: reqCookie });
+  assert.equal(openDetail.body.viewerRole, 'REQUESTER');
+  assert.equal(s.mreqCanCancel(openDetail.body.request.status, true), true,
+    'an OPEN own request must be cancellable');
+
+  // Cancel via the same endpoint the UI calls.
+  const cancel = await h.request({ method: 'POST', url: `/api/inter-pharmacy/medicine-requests/${id}/cancel`, cookie: reqCookie, body: {} });
+  assert.equal(cancel.status, 200, cancel.raw);
+  assert.equal(cancel.body.cancelled, true);
+  assert.equal(cancel.body.request.status, 'CANCELLED');
+
+  // After cancel: detail shows CANCELLED and the action is gone.
+  const afterDetail = await h.request({ method: 'GET', url: `/api/inter-pharmacy/medicine-requests/${id}`, cookie: reqCookie });
+  assert.equal(afterDetail.body.request.status, 'CANCELLED');
+  assert.equal(s.mreqCanCancel(afterDetail.body.request.status, true), false,
+    'a cancelled request must no longer be cancellable');
+  assert.doesNotMatch(s.mreqMyCard(afterDetail.body.request), /data-mreq-cancel/);
+  assert.match(s.mreqMyCard(afterDetail.body.request), /CANCELLED/);
+
+  // A repeat cancel is idempotent and stays 200 (the UI treats this as success).
+  const again = await h.request({ method: 'POST', url: `/api/inter-pharmacy/medicine-requests/${id}/cancel`, cookie: reqCookie, body: {} });
+  assert.equal(again.status, 200);
+  assert.equal(again.body.request.status, 'CANCELLED');
+
+  // No inventory moved by cancelling.
+  const after = await inventorySnapshot(h);
+  assert.equal(after.batches, before.batches);
+  assert.equal(after.totalUnits, before.totalUnits);
+  assert.equal(after.movements, before.movements);
+  assert.equal(after.movements, 0);
+});
+
+forEachDb(test, 'UI-107: a non-requester cannot cancel (safe 404) and the UI hides the action for them', async (h) => {
+  await setupRequester(h);
+  const b = await addTenant(h, 'Pharmacy B', COORDS.near, { stock: 80 });
+  const reqCookie = await login(h, 'staff@mediindex.local');
+  const id = (await createRequest(h, reqCookie, { requestedQuantity: 50 })).body.request.id;
+
+  // The contacted pharmacy sees the request as RECIPIENT — no cancel offered.
+  const s = ui();
+  const asB = await h.request({ method: 'GET', url: `/api/inter-pharmacy/medicine-requests/${id}`, cookie: await login(h, b.staffEmail) });
+  assert.equal(asB.body.viewerRole, 'RECIPIENT');
+  assert.equal(s.mreqCanCancel(asB.body.request.status, asB.body.viewerRole === 'REQUESTER'), false);
+
+  // And the server refuses a cancel from the non-requester, safely.
+  const bad = await h.request({ method: 'POST', url: `/api/inter-pharmacy/medicine-requests/${id}/cancel`, cookie: await login(h, b.staffEmail), body: {} });
+  assert.equal(bad.status, 404, 'a non-requester cancel must be rejected');
+  assert.match(bad.contentType, /application\/json/);
+  assert.equal(typeof bad.body.error, 'string');
+  // The request is untouched.
+  assert.equal((await h.db.get('SELECT status FROM medicine_requests WHERE id = ?', [id])).status, 'OPEN');
 });
 
 forEachDb(test, 'UI-103: an expired request is reported so the UI can show EXPIRED', async (h) => {

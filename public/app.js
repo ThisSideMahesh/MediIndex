@@ -1559,6 +1559,19 @@ const MREQ_OFFER_LABELS = {
   EXPIRED: 'EXPIRED'
 };
 
+/**
+ * Whether the requester may cancel a request from the UI.
+ *
+ * Only the requesting pharmacy, and only while the request is still an active,
+ * open search — OPEN or PARTIALLY_COVERED. Per the approved UI rules the action
+ * is deliberately NOT offered for CANCELLED, EXPIRED, NO_COVERAGE or
+ * FULLY_COVERED. The backend remains authoritative and re-checks on every call;
+ * this is a display gate only, kept intentionally no broader than the server.
+ */
+function mreqCanCancel(status, isRequester) {
+  return isRequester === true && ['OPEN', 'PARTIALLY_COVERED'].includes(status);
+}
+
 function mreqStatusBadge(status) {
   const key = String(status || '').toLowerCase();
   const label = MREQ_STATUS_LABELS[status] || MREQ_OFFER_LABELS[status] || status || '—';
@@ -1678,7 +1691,7 @@ function mreqMyCard(request) {
         <button type="button" class="secondary small-btn" data-mreq-detail="${request.id}">View offers</button>
         ${['OPEN', 'PARTIALLY_COVERED'].includes(request.status)
           ? `<button type="button" class="secondary small-btn" data-mreq-advance="${request.id}">Continue search</button>
-             <button type="button" class="danger small-btn" data-mreq-cancel="${request.id}">Cancel request</button>`
+             <button type="button" class="danger small-btn" data-mreq-cancel="${request.id}">Cancel Request</button>`
           : ''}
       </div>
     </article>`;
@@ -1876,11 +1889,15 @@ async function openMedicineRequestDetail(id) {
       <p class="muted font-xs">An accepted offer is a commitment to supply. Physical transfer is a separate, future workflow.</p>
     `;
 
-    const canCancel = res.viewerRole === 'REQUESTER' && ['OPEN', 'PARTIALLY_COVERED', 'FULLY_COVERED'].includes(r.status);
-    const canAdvance = res.viewerRole === 'REQUESTER' && ['OPEN', 'PARTIALLY_COVERED'].includes(r.status);
+    const isRequester = res.viewerRole === 'REQUESTER';
+    const canCancel = mreqCanCancel(r.status, isRequester);
+    const canAdvance = isRequester && ['OPEN', 'PARTIALLY_COVERED'].includes(r.status);
+    // Requester actions sit on the left; Close stays on the right. The
+    // "Cancel Request" action is always present in the detail modal for a
+    // cancellable own request — this is the action the manual review found missing.
     actionsEl.innerHTML = `
       ${canAdvance ? `<button type="button" class="secondary" data-mreq-advance="${r.id}">Continue search</button>` : ''}
-      ${canCancel ? `<button type="button" class="danger" data-mreq-cancel="${r.id}">Cancel request</button>` : ''}
+      ${canCancel ? `<button type="button" class="danger" data-mreq-cancel="${r.id}">Cancel Request</button>` : ''}
       <button class="secondary" type="button" data-close="mreq-detail-dialog">Close</button>`;
   } catch (err) {
     bodyEl.innerHTML = '<p class="empty">This request could not be loaded.</p>';
@@ -1987,21 +2004,29 @@ async function mreqAdvance(requestId, button) {
 }
 
 async function mreqCancel(requestId, button) {
-  if (!window.confirm('Cancel this medicine request? Pharmacies that have not yet responded will stop seeing it, and any committed quantities are released.')) return;
+  // Confirmation is mandatory — a click must never cancel outright.
+  if (!window.confirm('Cancel this medicine request?\n\nAny active search or offer workflow for this request will be cancelled.')) return;
   await mreqRunAction(button, async () => {
     try {
+      // The requester pharmacy is derived from the session server-side; no
+      // client pharmacy identity is sent. mreqRunAction blocks duplicate submits.
       await api(`${MREQ_API}/${requestId}/cancel`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({})
       });
       mreqSetError('');
+      // Close the detail modal (matches the existing convention), then refresh
+      // My Requests, Incoming and the incoming badge via loadMedicineRequestsView().
       const dialog = document.querySelector('#mreq-detail-dialog');
-      if (dialog.open) closeDialog('mreq-detail-dialog');
+      if (dialog && dialog.open) closeDialog('mreq-detail-dialog');
       await loadMedicineRequestsView();
     } catch (err) {
+      // Never claim success on failure. Show the server's safe message (incl. 409)
+      // and keep the request — and its still-valid Cancel action — visible.
       mreqSetError(err.message);
-      document.querySelector('#mreq-detail-error').textContent = err.message;
+      const detailError = document.querySelector('#mreq-detail-error');
+      if (detailError) detailError.textContent = err.message;
     }
   });
 }
