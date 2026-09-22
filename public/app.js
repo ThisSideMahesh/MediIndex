@@ -203,6 +203,7 @@ function switchView(view) {
   document.querySelector('#expiry-view').hidden = view !== 'expiry';
   document.querySelector('#redistribution-view').hidden = view !== 'redistribution';
   document.querySelector('#medicine-requests-view').hidden = view !== 'medicine-requests';
+  document.querySelector('#mobile-devices-view').hidden = view !== 'mobile-devices';
 
   if (view === 'inventory') loadMedicines();
   if (view === 'billing') loadBillingView();
@@ -211,6 +212,7 @@ function switchView(view) {
   if (view === 'expiry') loadAlerts();
   if (view === 'redistribution') loadRedistributionRequests();
   if (view === 'medicine-requests') loadMedicineRequestsView();
+  if (view === 'mobile-devices') loadMobileDevices();
 }
 
 // ----------------------------------------------------
@@ -1520,6 +1522,100 @@ document.querySelector('#redistribution-body').addEventListener('click', async e
     await loadRedistributionRequests();
   } catch (err) {
     document.querySelector('#redistribution-error').textContent = err.message;
+  }
+});
+
+// ----------------------------------------------------
+// MOBILE DEVICES (ADMIN-only pairing & device management)
+// ----------------------------------------------------
+
+/**
+ * Note: the device token returned by /api/mobile/pairing/complete is issued to
+ * the Android app directly during pairing — the web dashboard never receives
+ * or displays it. Only the one-time pairing CODE (not the device token) is
+ * shown here, because the admin must hand it to the person pairing the device.
+ */
+async function loadMobileDevices() {
+  const errorEl = document.querySelector('#devices-list-error');
+  const tbody = document.querySelector('#devices-body');
+  errorEl.textContent = '';
+  try {
+    const res = await api('/api/mobile/devices');
+    if (!res.devices || res.devices.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="muted text-center">No devices paired yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = res.devices.map(d => {
+      const statusBadge = d.revoked === 1
+        ? '<span class="badge badge-rejected">REVOKED</span>'
+        : '<span class="badge badge-accepted">ACTIVE</span>';
+      return `
+        <tr>
+          <td><strong>${escapeHtml(d.device_name)}</strong></td>
+          <td>${escapeHtml(d.device_model || '—')}</td>
+          <td>${formatServerTime(d.created_at)}</td>
+          <td>${d.last_seen_at ? formatServerTime(d.last_seen_at) : '—'}</td>
+          <td>${statusBadge}</td>
+          <td>
+            ${d.revoked === 1 ? '' : `<button class="danger small-btn" data-device-revoke="${d.id}">Revoke</button>`}
+          </td>
+        </tr>
+      `;
+    }).join('');
+  } catch (err) {
+    errorEl.textContent = err.message;
+    tbody.innerHTML = '<tr><td colspan="6" class="muted text-center">Unable to load devices.</td></tr>';
+  }
+}
+
+document.querySelector('#generate-pairing-code-btn').addEventListener('click', async () => {
+  const btn = document.querySelector('#generate-pairing-code-btn');
+  const errorEl = document.querySelector('#pairing-generate-error');
+  const resultEl = document.querySelector('#pairing-code-result');
+  errorEl.textContent = '';
+  btn.disabled = true;
+  btn.textContent = 'Generating…';
+  try {
+    const res = await api('/api/mobile/pairing/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    document.querySelector('#pairing-code-value').textContent = res.pairingCode;
+    const remaining = formatRemaining(res.expiresAt);
+    document.querySelector('#pairing-code-expiry').textContent = remaining
+      ? `This code is one-time use and expires in ${remaining}.`
+      : 'This code is one-time use and expires shortly.';
+    resultEl.hidden = false;
+  } catch (err) {
+    errorEl.textContent = err.message;
+    resultEl.hidden = true;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Generate Pairing Code';
+  }
+});
+
+document.querySelector('#refresh-devices-btn').addEventListener('click', loadMobileDevices);
+
+document.querySelector('#devices-body').addEventListener('click', async event => {
+  const deviceId = event.target.dataset.deviceRevoke;
+  if (!deviceId) return;
+  const button = event.target;
+  const errorEl = document.querySelector('#devices-list-error');
+  errorEl.textContent = '';
+  if (!confirm('Revoke this device? It will no longer be able to sync or authenticate.')) return;
+  button.disabled = true;
+  try {
+    await api(`/api/mobile/devices/${deviceId}/revoke`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    await loadMobileDevices();
+  } catch (err) {
+    errorEl.textContent = err.message;
+    button.disabled = false;
   }
 });
 

@@ -1342,6 +1342,16 @@ dialog form {
   background: #f8fafc;
   color: var(--muted);
 }
+#pairing-code-result {
+  padding: 14px 18px;
+  border-radius: 10px;
+  border-left: 5px solid #16a34a;
+  background: var(--success-bg);
+  margin-bottom: 18px;
+}
+#pairing-code-value {
+  color: var(--success-text);
+}
 .badge-auto {
   background: #eff6ff; color: #1d4ed8;
   border: 1px solid #bfdbfe;

@@ -9,7 +9,7 @@
     </section>
     <section id="app-view" hidden>
       <header><div class="brand-row"><img class="header-logo" src="/assets/mediindex-logo.png" alt="MediIndex"><div><p class="eyebrow">OFFLINE-READY LOCAL SYSTEM</p><h1>MediIndex <span>Dashboard</span></h1></div></div><div class="user"><span id="user-name"></span><div id="sync-status" class="sync-status" title="Synchronization status" hidden><span id="sync-icon" class="sync-icon">●</span><span id="sync-label">Online</span><span id="sync-pending" class="sync-pending" hidden></span></div><button id="logout" class="secondary">Logout</button></div></header>
-      <nav aria-label="Main navigation"><button class="nav active" data-view="dashboard">Dashboard</button><button class="nav" data-view="inventory">Medicines &amp; inventory</button><button class="nav" data-view="billing">Billing &amp; POS</button><button class="nav" data-view="analytics">Demand Forecasting</button><button class="nav" data-view="store-map">Store Layout (2D)</button><button class="nav" data-view="expiry">Expiry alerts</button><button class="nav admin-only-nav" data-view="redistribution" hidden>Near-Expiry Redistribution</button><button class="nav" data-view="medicine-requests">Medicine Requests<span id="medicine-requests-badge" class="nav-badge" hidden>0</span></button></nav>
+      <nav aria-label="Main navigation"><button class="nav active" data-view="dashboard">Dashboard</button><button class="nav" data-view="inventory">Medicines &amp; inventory</button><button class="nav" data-view="billing">Billing &amp; POS</button><button class="nav" data-view="analytics">Demand Forecasting</button><button class="nav" data-view="store-map">Store Layout (2D)</button><button class="nav" data-view="expiry">Expiry alerts</button><button class="nav admin-only-nav" data-view="redistribution" hidden>Near-Expiry Redistribution</button><button class="nav admin-only-nav" data-view="mobile-devices" hidden>Mobile Devices</button><button class="nav" data-view="medicine-requests">Medicine Requests<span id="medicine-requests-badge" class="nav-badge" hidden>0</span></button></nav>
       <p class="demo-note">DEMO / SYNTHETIC DATA - values are calculated from the local SQLite database.</p>
       <section id="dashboard-view"><div class="grid" id="metrics"></div><section class="panel"><h2>Foundation status</h2><ul><li><strong>Database:</strong> SQLite is connected and persisted locally.</li><li><strong>Authentication:</strong> password hashes, expiring server sessions and protected API routes are active.</li><li><strong>Inventory &amp; Billing:</strong> catalogue management, multi-batch stock, and transactional FEFO billing are active.</li><li><strong>Forecasting Engine:</strong> 3-period Weighted Moving Average (WMA) with hard reliability guardrails.</li><li><strong>Store Layout:</strong> 2D interactive floor plan visualizer for rapid medicine localization.</li></ul></section></section>
       <section id="inventory-view" hidden>
@@ -415,6 +415,37 @@
             </thead>
             <tbody id="redistribution-body">
               <tr><td colspan="12" class="muted text-center">Run a scan or refresh to view requests.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="mobile-devices-view" hidden>
+        <div class="section-heading">
+          <div><p class="eyebrow">ADMIN · MOBILE DEVICE PAIRING</p><h2>Mobile Devices</h2></div>
+          <button id="generate-pairing-code-btn">Generate Pairing Code</button>
+        </div>
+        <p class="muted" style="margin-bottom:1rem">Pair a phone or tablet running the MediIndex Android app with this pharmacy. Generate a one-time code below, then enter it in the app on the device to complete pairing.</p>
+        <p id="pairing-generate-error" class="error" role="alert"></p>
+        <div id="pairing-code-result" hidden>
+          <p class="eyebrow">MOBILE DEVICE PAIRING</p>
+          <p class="muted" style="margin-bottom:0.25rem">Pairing Code</p>
+          <p id="pairing-code-value" style="font-size:2rem;font-weight:800;letter-spacing:0.08em;margin:0 0 0.5rem"></p>
+          <p class="muted">Enter this code in the MediIndex Android app.</p>
+          <p class="hint" id="pairing-code-expiry"></p>
+        </div>
+        <div class="section-heading" style="margin-top:2rem">
+          <div><p class="eyebrow">PAIRED DEVICES</p><h3>Devices</h3></div>
+          <button id="refresh-devices-btn" class="secondary">Refresh</button>
+        </div>
+        <p id="devices-list-error" class="error" role="alert"></p>
+        <div class="table-responsive">
+          <table class="pos-table" id="devices-table">
+            <thead>
+              <tr><th>Device name</th><th>Model</th><th>Created</th><th>Last seen</th><th>Status</th><th>Action</th></tr>
+            </thead>
+            <tbody id="devices-body">
+              <tr><td colspan="6" class="muted text-center">Loading devices…</td></tr>
             </tbody>
           </table>
         </div>
