@@ -735,6 +735,12 @@ dialog form {
   background: #fff;
 }
 
+.qr-code-svg svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
 .qr-sticker-meta h3 {
   margin: 0 0 4px 0;
   font-size: 1.05rem;
@@ -893,4 +899,764 @@ dialog form {
   .no-print {
     display: none !important;
   }
+}
+
+/* ============================================================
+   STORE LAYOUT (2D) — Pharmacy Floor Plan & Shelf Map
+   ============================================================ */
+
+.map-controls-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.map-controls-row .grow {
+  flex: 1;
+}
+
+.map-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 10px 14px;
+  background: #f8fafc;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  margin-bottom: 18px;
+  font-size: 0.81rem;
+  color: var(--muted);
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  display: inline-block;
+  border: 1px solid #cbd5e1;
+}
+
+.legend-dot.occupied    { background: #86efac; border-color: #4ade80; }
+.legend-dot.empty       { background: #e2e8f0; border-color: #94a3b8; }
+.legend-dot.expiring    { background: #fde68a; border-color: #f59e0b; }
+.legend-dot.expired     { background: #fca5a5; border-color: #ef4444; }
+.legend-dot.highlighted { background: #67e8f9; border-color: #0891b2; }
+
+/* Two-column store layout: floor plan left, inspector right */
+.store-map-container {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 18px;
+  align-items: start;
+}
+
+.floor-plan-panel {
+  background: rgba(255,255,255,0.92);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 20px;
+}
+
+.floor-plan-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Service zone banner */
+.pharmacy-zone.service-zone {
+  background: var(--accent-light);
+  border: 1px solid #99f6e4;
+  border-radius: 10px;
+  padding: 12px 16px;
+  text-align: center;
+}
+
+.zone-label {
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  color: var(--accent-dark);
+  margin-bottom: 6px;
+}
+
+.counter-box {
+  font-size: 0.9rem;
+  color: var(--ink);
+}
+
+/* Main two-aisle grid */
+.main-aisles-grid {
+  display: grid;
+  grid-template-columns: 1fr 40px 1fr;
+  gap: 10px;
+  align-items: start;
+}
+
+.aisle-column {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.aisle-walkway {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  writing-mode: vertical-rl;
+  background: #f1f5f9;
+  border: 1px dashed #94a3b8;
+  border-radius: 8px;
+  padding: 8px 4px;
+  font-size: 0.68rem;
+  color: var(--muted);
+  text-align: center;
+  min-height: 120px;
+}
+
+/* Bottom storage row: cold storage + unassigned */
+.bottom-storage-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+/* Rack cards */
+.rack-card {
+  background: #f8fafc;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.cold-storage-card {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.unassigned-card {
+  background: #fffbeb;
+  border-color: #fde68a;
+}
+
+.rack-header {
+  margin-bottom: 10px;
+}
+
+.rack-header h4 {
+  margin: 0 0 3px;
+  font-size: 0.84rem;
+  color: var(--ink);
+}
+
+/* Shelf grid inside a rack */
+.shelf-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.cold-grid {
+  grid-template-columns: repeat(2, 1fr);
+}
+
+/* Individual shelf node button */
+.shelf-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 10px 8px;
+  border-radius: 10px;
+  border: 2px solid var(--line);
+  background: #fff;
+  color: var(--ink);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
+  font-weight: 600;
+  min-height: 70px;
+  gap: 4px;
+}
+
+.shelf-node:hover {
+  border-color: var(--accent);
+  background: var(--accent-light);
+  box-shadow: 0 2px 8px #0d948820;
+}
+
+.shelf-name {
+  font-size: 0.8rem;
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.shelf-desc {
+  font-size: 0.68rem;
+  color: var(--muted);
+  line-height: 1.3;
+}
+
+.shelf-badge {
+  margin-top: 4px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: #e2e8f0;
+  color: #475569;
+  font-size: 0.7rem;
+  font-weight: 800;
+}
+
+/* Stock-state visual classes applied by JS */
+.shelf-node.occupied {
+  border-color: #4ade80;
+  background: #f0fdf4;
+}
+
+.shelf-node.occupied .shelf-badge {
+  background: #bbf7d0;
+  color: #166534;
+}
+
+.shelf-node.empty-shelf {
+  border-color: #cbd5e1;
+  background: #f8fafc;
+  opacity: 0.65;
+}
+
+.shelf-node.has-expiring {
+  border-color: #f59e0b;
+  background: #fffbeb;
+}
+
+.shelf-node.has-expiring .shelf-badge {
+  background: #fde68a;
+  color: #92400e;
+}
+
+.shelf-node.has-expired {
+  border-color: #ef4444;
+  background: #fff1f2;
+}
+
+.shelf-node.has-expired .shelf-badge {
+  background: #fecaca;
+  color: #991b1b;
+}
+
+/* Selected/active shelf */
+.shelf-node.active-shelf {
+  border-color: var(--accent-dark) !important;
+  background: var(--accent-light) !important;
+  box-shadow: 0 0 0 3px #99f6e4, 0 2px 10px #0d948830;
+}
+
+.shelf-node.active-shelf .shelf-name {
+  color: var(--accent-dark);
+}
+
+/* Medicine search highlight — pulsing cyan glow */
+@keyframes pulse-highlight {
+  0%   { box-shadow: 0 0 0 0 #22d3ee80; }
+  50%  { box-shadow: 0 0 0 8px #22d3ee30; }
+  100% { box-shadow: 0 0 0 0 #22d3ee00; }
+}
+
+.shelf-node.pulsing-highlight {
+  border-color: #0891b2 !important;
+  background: #ecfeff !important;
+  animation: pulse-highlight 0.9s ease-in-out 3;
+}
+
+.shelf-node.pulsing-highlight .shelf-badge {
+  background: #cffafe;
+  color: #164e63;
+}
+
+/* Inspector panel (right column) */
+.shelf-inspector-panel {
+  position: sticky;
+  top: 16px;
+}
+
+.inspector-header {
+  margin-bottom: 14px;
+}
+
+.inspector-header h3 {
+  margin: 6px 0 4px;
+}
+
+.inspector-summary {
+  margin-bottom: 14px;
+}
+
+.inspector-table-wrapper {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+/* Cold-node cosmetics */
+.cold-node {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.cold-node.occupied {
+  border-color: #3b82f6;
+  background: #dbeafe;
+}
+
+/* Unassigned node */
+.unassigned-node {
+  width: 100%;
+  background: #fffbeb;
+  border-color: #fde68a;
+}
+
+.unassigned-node.occupied {
+  border-color: #d97706;
+  background: #fef3c7;
+}
+
+/* Responsive: collapse to single column on tablet/mobile */
+@media (max-width: 900px) {
+  .store-map-container {
+    grid-template-columns: 1fr;
+  }
+  .shelf-inspector-panel {
+    position: static;
+  }
+}
+
+@media (max-width: 680px) {
+  .main-aisles-grid {
+    grid-template-columns: 1fr;
+  }
+  .aisle-walkway {
+    writing-mode: horizontal-tb;
+    min-height: auto;
+    padding: 6px 12px;
+  }
+  .bottom-storage-grid {
+    grid-template-columns: 1fr;
+  }
+  .shelf-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+/* ============================================================
+   SYNC STATUS INDICATOR
+   ============================================================ */
+
+.sync-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  border: 1px solid var(--line);
+  background: #f8fafc;
+  white-space: nowrap;
+  transition: background 0.2s, border-color 0.2s;
+}
+
+.sync-icon {
+  font-size: 0.65rem;
+  line-height: 1;
+}
+
+.sync-pending {
+  background: #e2e8f0;
+  color: #475569;
+  padding: 1px 5px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 800;
+}
+
+/* State: online */
+.sync-status.is-online {
+  background: var(--success-bg);
+  border-color: #4ade80;
+  color: var(--success-text);
+}
+.sync-status.is-online .sync-icon { color: #16a34a; }
+
+/* State: offline */
+.sync-status.is-offline {
+  background: var(--warning-bg);
+  border-color: #f59e0b;
+  color: var(--warning-text);
+}
+.sync-status.is-offline .sync-icon { color: #d97706; }
+
+/* State: syncing */
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.sync-status.is-syncing {
+  background: #eff6ff;
+  border-color: #60a5fa;
+  color: #1d4ed8;
+}
+.sync-status.is-syncing .sync-icon {
+  color: #3b82f6;
+  animation: spin 1s linear infinite;
+  display: inline-block;
+}
+
+/* State: synced */
+.sync-status.is-synced {
+  background: var(--success-bg);
+  border-color: #4ade80;
+  color: var(--success-text);
+}
+.sync-status.is-synced .sync-icon { color: #16a34a; }
+
+/* State: failed */
+.sync-status.is-failed {
+  background: var(--danger-bg);
+  border-color: #f87171;
+  color: var(--danger);
+}
+.sync-status.is-failed .sync-icon { color: var(--danger); }
+
+/* ============================================================
+   NEAR-EXPIRY REDISTRIBUTION
+   ============================================================ */
+
+.redistrib-scan-result {
+  padding: 14px 18px;
+  border-radius: 10px;
+  border-left: 5px solid #16a34a;
+  background: var(--success-bg);
+  color: var(--success-text);
+  font-size: 0.9rem;
+  margin-bottom: 18px;
+}
+.redistrib-scan-result.no-action {
+  border-left-color: var(--muted);
+  background: #f8fafc;
+  color: var(--muted);
+}
+#pairing-code-result {
+  padding: 14px 18px;
+  border-radius: 10px;
+  border-left: 5px solid #16a34a;
+  background: var(--success-bg);
+  margin-bottom: 18px;
+}
+#pairing-code-value {
+  color: var(--success-text);
+}
+.badge-auto {
+  background: #eff6ff; color: #1d4ed8;
+  border: 1px solid #bfdbfe;
+  border-radius: 999px; padding: 2px 7px;
+  font-size: 0.7rem; font-weight: 800;
+}
+.badge-accepted  { background: var(--success-bg); color: var(--success-text); }
+.badge-pending   { background: var(--warning-bg); color: var(--warning-text); }
+.badge-rejected, .badge-cancelled { background: #e2e8f0; color: #475569; }
+.badge-completed { background: #eff6ff; color: #1d4ed8; }
+
+/* ====================================================
+   MANUAL MEDICINE REQUESTS
+   Reuses the existing palette, badge and panel conventions.
+   ==================================================== */
+
+.nav-badge {
+  display: inline-block;
+  min-width: 1.25rem;
+  margin-left: 0.4rem;
+  padding: 0.05rem 0.35rem;
+  border-radius: 999px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 700;
+  line-height: 1.4;
+  text-align: center;
+  vertical-align: middle;
+}
+
+.mreq-heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.mreq-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.5rem 0 1rem;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.5rem;
+}
+
+.mreq-tab {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.45rem 0.9rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mreq-tab.active {
+  background: var(--accent-light);
+  border-color: var(--accent);
+  color: var(--accent-dark);
+}
+
+.mreq-list {
+  display: grid;
+  gap: 1rem;
+}
+
+.mreq-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 1rem 1.1rem;
+  background: var(--surface);
+}
+
+.mreq-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.mreq-card-head h3 {
+  margin: 0 0 0.2rem;
+  font-size: 1.05rem;
+}
+
+.mreq-card-head p { margin: 0; }
+
+.mreq-coverage { margin: 0.85rem 0; }
+
+.mreq-coverage-figures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+}
+
+.mreq-coverage-figures strong { color: var(--ink); }
+
+.mreq-coverage-track {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.mreq-coverage-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.mreq-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.1rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+  margin-bottom: 0.5rem;
+}
+
+.mreq-meta strong { color: var(--ink); }
+
+.mreq-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}
+
+/* Progressive search ladder */
+.mreq-search {
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  padding: 0.7rem 0.9rem;
+  margin: 0.85rem 0;
+  background: #f8fafc;
+}
+
+.mreq-search-headline {
+  margin: 0 0 0.45rem;
+  font-size: 0.86rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.mreq-zone-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.2rem;
+}
+
+.mreq-zone {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.mreq-zone.reached { color: var(--ink); }
+
+.mreq-zone-dot { color: var(--line); font-size: 0.75rem; }
+.mreq-zone.reached .mreq-zone-dot { color: var(--accent); }
+
+/* Incoming request offer controls */
+.mreq-offer-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: flex-end;
+  margin-top: 0.6rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid var(--line);
+}
+
+.mreq-offer-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+  margin: 0;
+}
+
+.mreq-offer-input {
+  width: 7rem;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+
+.mreq-nostock {
+  margin: 0;
+  flex: 1 1 14rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--warning-text);
+  background: var(--warning-bg);
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+}
+
+.mreq-commit-note { margin: 0.3rem 0 0; font-style: italic; }
+
+.mreq-notice {
+  margin: 0.6rem 0;
+  padding: 0.55rem 0.75rem;
+  border-radius: 8px;
+  background: var(--accent-light);
+  color: var(--accent-dark);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.mreq-success-text { color: var(--success-text); }
+
+/* Detail dialog */
+.mreq-detail-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 0.4rem;
+}
+
+.mreq-offers-heading {
+  margin: 1rem 0 0.5rem;
+  font-size: 0.95rem;
+}
+
+.mreq-offer-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.6rem;
+}
+
+.mreq-offer-item {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.6rem 0.75rem;
+}
+
+.mreq-offer-main {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.mreq-offer-figures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+  margin-top: 0.25rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.mreq-offer-figures strong { color: var(--ink); }
+
+/* Status badges — request and offer states */
+.mreq-badge-open              { background: #eff6ff; color: #1d4ed8; }
+.mreq-badge-partially_covered { background: var(--warning-bg); color: var(--warning-text); }
+.mreq-badge-fully_covered     { background: var(--success-bg); color: var(--success-text); }
+.mreq-badge-no_coverage       { background: var(--danger-bg); color: var(--danger); }
+.mreq-badge-cancelled         { background: #e2e8f0; color: #475569; }
+.mreq-badge-expired           { background: #e2e8f0; color: #475569; }
+.mreq-badge-pending           { background: var(--warning-bg); color: var(--warning-text); }
+.mreq-badge-accepted          { background: var(--success-bg); color: var(--success-text); }
+.mreq-badge-declined          { background: var(--danger-bg); color: var(--danger); }
+.mreq-badge-superseded        { background: #e2e8f0; color: #475569; }
+.mreq-badge-urgent            { background: var(--danger-bg); color: var(--danger); }
+
+#mreq-detail-dialog { max-width: 42rem; width: min(42rem, 94vw); }
+
+/* Responsive: stack cleanly on tablet and mobile */
+@media (max-width: 720px) {
+  .mreq-heading-actions { width: 100%; }
+  .mreq-heading-actions button { flex: 1 1 auto; }
+  .mreq-card-head { flex-direction: column; }
+  .mreq-coverage-figures { gap: 0.5rem 0.9rem; }
+  .mreq-meta { flex-direction: column; gap: 0.25rem; }
+  .mreq-offer-row { flex-direction: column; align-items: stretch; }
+  .mreq-offer-input { width: 100%; }
+  .mreq-offer-row button { width: 100%; min-height: 2.6rem; }
+  .mreq-card-actions button { flex: 1 1 100%; min-height: 2.6rem; }
+  .mreq-tab { flex: 1 1 auto; min-height: 2.5rem; }
+  #mreq-detail-dialog { width: 96vw; }
 }

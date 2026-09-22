@@ -88,33 +88,33 @@ test('ADAPTER-SELECT-005: PostgreSQL connection string passed via options', () =
   assert.equal(adapter.connectionString, 'postgresql://test:test@localhost:5432/test');
 });
 
-test('ADAPTER-SELECT-006: server.js uses createDatabaseAdapter factory', () => {
-  // Verify server.js imports the factory, not direct adapter
+test('ADAPTER-SELECT-006: core.js uses createDatabaseAdapter factory', () => {
+  // Verify core.js imports the factory, not direct adapter
   const serverCode = require('node:fs').readFileSync(
-    require('node:path').join(__dirname, '..', 'server.js'),
+    require('node:path').join(__dirname, '..', 'core.js'),
     'utf-8'
   );
   
   // Should import createDatabaseAdapter
-  assert.match(serverCode, /createDatabaseAdapter/, 'server.js should import createDatabaseAdapter');
+  assert.match(serverCode, /createDatabaseAdapter/, 'core.js should import createDatabaseAdapter');
   
   // Should NOT directly construct SQLiteAdapter
   assert.ok(
     !serverCode.includes('new SQLiteAdapter('),
-    'server.js should NOT directly construct SQLiteAdapter'
+    'core.js should NOT directly construct SQLiteAdapter'
   );
   
   // Should use createDatabaseAdapter()
   assert.match(
     serverCode,
     /createDatabaseAdapter\(/,
-    'server.js should call createDatabaseAdapter()'
+    'core.js should call createDatabaseAdapter()'
   );
 });
 
-test('ADAPTER-SELECT-007: No in-memory session Map in server.js', () => {
+test('ADAPTER-SELECT-007: No in-memory session Map in core.js', () => {
   const serverCode = require('node:fs').readFileSync(
-    require('node:path').join(__dirname, '..', 'server.js'),
+    require('node:path').join(__dirname, '..', 'core.js'),
     'utf-8'
   );
   
@@ -122,7 +122,7 @@ test('ADAPTER-SELECT-007: No in-memory session Map in server.js', () => {
   const sessionMapPattern = /const\s+sessions\s*=\s*new\s+Map\(\)/;
   assert.ok(
     !sessionMapPattern.test(serverCode),
-    'server.js should NOT have in-memory sessions Map'
+    'core.js should NOT have in-memory sessions Map'
   );
 });
 
@@ -144,15 +144,18 @@ test('ADAPTER-SELECT-008: Adapter initialization is synchronous for SQLite', () 
   }
 });
 
-test('ADAPTER-SELECT-009: PostgreSQL adapter has async initialize', () => {
+test('ADAPTER-SELECT-009: PostgreSQL adapter initialize returns adapter synchronously', () => {
   const adapter = createDatabaseAdapter({ 
     type: 'postgres',
     connectionString: 'postgresql://test:test@localhost:5432/test'
   });
   
-  // PostgreSQLAdapter.initialize() returns a Promise
+  // PostgreSQLAdapter.initialize() is synchronous (just constructs the pool object)
+  // and returns `this` — consistent with SQLiteAdapter.initialize()
   const result = adapter.initialize();
-  assert.ok(result instanceof Promise, 'PostgreSQL initialize should return Promise');
+  assert.ok(!(result instanceof Promise), 'PostgreSQL initialize must NOT return a Promise');
+  assert.ok(result === adapter, 'PostgreSQL initialize must return the adapter instance');
+  assert.ok(result.isInitialized, 'Adapter must be marked initialized');
 });
 
 test('ADAPTER-SELECT-010: Adapter type is exposed for debugging', () => {

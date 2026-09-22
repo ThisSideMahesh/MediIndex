@@ -4,14 +4,20 @@
   "private": true,
   "description": "Offline-first medicine inventory and expiry management system",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js",
+    "start": "node core.js",
+    "dev": "node --watch core.js",
     "test": "node --test --test-concurrency=1 tests/*.test.js"
   },
   "engines": {
     "node": ">=22"
   },
   "dependencies": {
-    "pg": "8.13.3"
+    "jsdom": "^30.1.1",
+    "pg": "8.13.3",
+    "pngjs": "^7.0.0",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "jsqr": "^1.4.0"
   }
 }

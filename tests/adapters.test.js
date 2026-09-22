@@ -83,21 +83,22 @@ test('ADAPTER-003: SQLite transaction commit', () => {
   adapter.run('DELETE FROM device_pairing_codes WHERE pairing_code = ?', [code]);
 });
 
-test('ADAPTER-004: SQLite transaction rollback on error', () => {
+test('ADAPTER-004: SQLite transaction rollback on error', async () => {
   const adapter = new SQLiteAdapter().initialize();
   const pharmacy = adapter.get('SELECT id FROM pharmacies LIMIT 1');
   const admin = adapter.get('SELECT id FROM users WHERE email = ?', ['admin@mediindex.local']);
   const code = 'TX-ROLLBACK-' + Date.now();
 
-  assert.throws(() => {
-    adapter.transaction((tx) => {
+  await assert.rejects(
+    () => adapter.transaction(async (tx) => {
       tx.run(
         'INSERT INTO device_pairing_codes (pharmacy_id, pairing_code, created_by, expires_at) VALUES (?, ?, ?, ?)',
         [pharmacy.id, code, admin.id, new Date(Date.now() + 600000).toISOString()]
       );
       throw new Error('Simulated failure inside transaction');
-    });
-  }, /Simulated failure inside transaction/);
+    }),
+    /Simulated failure inside transaction/
+  );
 
   const check = adapter.get('SELECT * FROM device_pairing_codes WHERE pairing_code = ?', [code]);
   assert.equal(check, undefined, 'Rolled back record should not exist in database');

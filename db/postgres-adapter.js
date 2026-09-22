@@ -1,4 +1,6 @@
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 
 function sanitizeConnectionString(connString) {
   if (!connString || typeof connString !== 'string') return '';
@@ -12,6 +14,91 @@ function sanitizeConnectionString(connString) {
     // If URL parsing fails, mask any user:pass@ occurrence
     return connString.replace(/:\/\/([^:]+):([^@]+)@/, '://$1:*****@');
   }
+}
+
+// ─── Schema-initialization advisory lock ──────────────────────────────────────
+// Deterministic 64-bit advisory-lock key dedicated to MediIndex schema
+// initialization. Derived from a namespaced constant string so it is stable
+// across processes and deploys, and so it cannot collide with advisory locks
+// taken by unrelated application logic (which would use different namespaces).
+//   SCHEMA_LOCK_ID = signed int64 from the first 8 bytes of
+//                    SHA-256('mediindex:schema:init:v1')
+// Exported for observability (it can be matched against pg_locks.objid).
+const SCHEMA_LOCK_NAMESPACE = 'mediindex:schema:init:v1';
+const SCHEMA_LOCK_ID = crypto
+  .createHash('sha256')
+  .update(SCHEMA_LOCK_NAMESPACE)
+  .digest()
+  .readBigInt64BE(0)
+  .toString(); // pass as string so the pg driver binds it as bigint without precision loss
+
+// Bounded wait for the advisory lock. Advisory locks ignore lock_timeout, so a
+// blocking pg_advisory_lock() could hang until the serverless function timeout.
+const SCHEMA_LOCK_WAIT_MS = Number(process.env.MEDIINDEX_SCHEMA_LOCK_WAIT_MS || 15000);
+const SCHEMA_LOCK_POLL_MS = 100;
+
+// PostgreSQL codes emitted when concurrent DDL loses a creation race.
+// 23505 = unique_violation on pg_type/pg_class catalog indexes
+// 42P07 = duplicate_table / relation already exists
+const BENIGN_DDL_RACE_CODES = new Set(['23505', '42P07']);
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Derives the set of objects schema.pg.sql is expected to create, straight from
+ * the SQL text. Parsing the file rather than hardcoding a list means the
+ * verification automatically covers future additions and cannot drift.
+ */
+function parseExpectedSchemaObjects(schemaSql) {
+  const tables = [...schemaSql.matchAll(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+([A-Za-z0-9_]+)/gi)]
+    .map(m => m[1].toLowerCase());
+  const columns = [...schemaSql.matchAll(/ALTER\s+TABLE\s+([A-Za-z0-9_]+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+([A-Za-z0-9_]+)/gi)]
+    .map(m => ({ table: m[1].toLowerCase(), column: m[2].toLowerCase() }));
+  const indexes = [...schemaSql.matchAll(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+([A-Za-z0-9_]+)/gi)]
+    .map(m => m[1].toLowerCase());
+  return {
+    tables: [...new Set(tables)],
+    columns,
+    indexes: [...new Set(indexes)]
+  };
+}
+
+/** Returns true only when every expected table, column and index exists. */
+async function verifySchemaObjects(client, expected) {
+  return (await describeMissingSchemaObjects(client, expected)) === '';
+}
+
+/** Returns a human-readable description of missing objects ('' when complete). */
+async function describeMissingSchemaObjects(client, expected) {
+  const missing = [];
+
+  if (expected.tables.length > 0) {
+    const res = await client.query(
+      "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = ANY($1::text[])",
+      [expected.tables]
+    );
+    const present = new Set(res.rows.map(r => r.table_name.toLowerCase()));
+    for (const t of expected.tables) if (!present.has(t)) missing.push(`table ${t}`);
+  }
+
+  for (const { table, column } of expected.columns) {
+    const res = await client.query(
+      "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2",
+      [table, column]
+    );
+    if (res.rowCount === 0) missing.push(`column ${table}.${column}`);
+  }
+
+  if (expected.indexes.length > 0) {
+    const res = await client.query(
+      "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND indexname = ANY($1::text[])",
+      [expected.indexes]
+    );
+    const present = new Set(res.rows.map(r => r.indexname.toLowerCase()));
+    for (const i of expected.indexes) if (!present.has(i)) missing.push(`index ${i}`);
+  }
+
+  return missing.join(', ');
 }
 
 function convertPlaceholders(sql) {
@@ -162,10 +249,113 @@ class PostgreSQLAdapter {
     return this.pool;
   }
 
-  async initialize() {
+  initialize() {
     this.getPool();
     this.isInitialized = true;
     return this;
+  }
+
+  /**
+   * Applies db/schema.pg.sql once per process, idempotently and safely under
+   * concurrent cold starts.
+   *
+   * Unlike SQLiteAdapter.initialize() — which calls applySchema() +
+   * applyMigrations() on every startup — the PostgreSQL path previously only
+   * opened a connection pool and never applied schema at runtime. Schema was
+   * applied only by scripts/bootstrap-postgres.js (a manual one-off) or by the
+   * integration tests. Any DDL appended to schema.pg.sql after the last manual
+   * bootstrap therefore never reached the deployed database, causing
+   * "relation ... does not exist" (SQLSTATE 42P01) at runtime.
+   *
+   * schema.pg.sql is fully idempotent (CREATE TABLE IF NOT EXISTS,
+   * ADD COLUMN IF NOT EXISTS, CREATE INDEX IF NOT EXISTS). However, those forms
+   * are NOT race-free in PostgreSQL: two sessions that simultaneously observe an
+   * object as absent can both attempt creation, and the loser fails with
+   * 23505 (unique violation on pg_type/pg_class) or 42P07 (relation exists).
+   * Schema application is therefore serialized with a dedicated PostgreSQL
+   * advisory lock, and completion is always confirmed by verifying the objects
+   * actually exist before resolving.
+   *
+   * Memoized so it runs at most once per process; on failure the memo is
+   * cleared so a later request can retry rather than the process staying
+   * permanently broken.
+   */
+  async ensureSchema() {
+    if (this._schemaReady) return this._schemaReady;
+    this._schemaReady = this._applySchemaWithAdvisoryLock().catch(err => {
+      this._schemaReady = null; // allow retry on the next request
+      throw err;
+    });
+    return this._schemaReady;
+  }
+
+  /**
+   * Serializes schema application across processes with a PostgreSQL advisory lock.
+   *
+   * pg_advisory_lock is SESSION-scoped, so the lock, the DDL and the unlock must
+   * all run on the SAME dedicated connection — pool.query() would pick arbitrary
+   * connections and the lock would not protect the DDL.
+   *
+   * pg_try_advisory_lock (non-blocking) is used in a bounded wait loop rather
+   * than the blocking pg_advisory_lock, because advisory locks ignore
+   * lock_timeout and a blocking acquire could hang a serverless request until
+   * the platform function timeout.
+   */
+  async _applySchemaWithAdvisoryLock() {
+    const schemaSql = fs.readFileSync(path.join(__dirname, 'schema.pg.sql'), 'utf-8');
+    const expected = parseExpectedSchemaObjects(schemaSql);
+    const pool = this.getPool();
+    const client = await pool.connect();
+    let lockHeld = false;
+
+    try {
+      const deadline = Date.now() + SCHEMA_LOCK_WAIT_MS;
+
+      // ── Acquire the dedicated schema-initialization advisory lock ──
+      for (;;) {
+        const res = await client.query('SELECT pg_try_advisory_lock($1) AS acquired', [SCHEMA_LOCK_ID]);
+        if (res.rows[0] && res.rows[0].acquired === true) { lockHeld = true; break; }
+
+        // Another instance holds the lock and is applying the schema. If it has
+        // already finished, our work is done — verify and return without waiting.
+        if (await verifySchemaObjects(client, expected)) return;
+
+        if (Date.now() >= deadline) {
+          // Final chance: the holder may have completed during the last interval.
+          if (await verifySchemaObjects(client, expected)) return;
+          throw new Error(
+            'Timed out waiting for the MediIndex schema-initialization advisory lock ' +
+            `(${SCHEMA_LOCK_WAIT_MS}ms). Schema is incomplete; the next request will retry.`
+          );
+        }
+        await sleep(SCHEMA_LOCK_POLL_MS);
+      }
+
+      // ── Lock held: apply the idempotent schema ──
+      try {
+        await client.query(schemaSql);
+      } catch (err) {
+        // With the lock held our own instances are serialized, so these codes
+        // should not occur. An external actor (e.g. a manual bootstrap run or a
+        // migration tool) could still race us. Tolerate only the benign
+        // "already exists" codes — and never on trust: the verification below is
+        // what actually guarantees the schema is complete.
+        if (!BENIGN_DDL_RACE_CODES.has(err.code)) throw err;
+      }
+
+      // ── Guarantee completeness before resolving ──
+      if (!(await verifySchemaObjects(client, expected))) {
+        const missing = await describeMissingSchemaObjects(client, expected);
+        throw new Error('Schema verification failed after application. Missing: ' + missing);
+      }
+    } finally {
+      if (lockHeld) {
+        // Must unlock explicitly: the connection returns to the pool for reuse,
+        // so the session (and its advisory locks) would otherwise persist.
+        try { await client.query('SELECT pg_advisory_unlock($1)', [SCHEMA_LOCK_ID]); } catch {}
+      }
+      client.release();
+    }
   }
 
   async query(sql, params = []) {
@@ -250,6 +440,19 @@ class PostgreSQLAdapter {
     }
   }
 
+  // prepare(sql) returns a statement-like object with async .get(), .run(), .all().
+  // This makes the PostgreSQL adapter interface compatible with the same call pattern
+  // used for SQLite's DatabaseSync.prepare(), so core.js can call
+  // db.prepare(sql).get(...params) / .run(...params) / .all(...params) uniformly.
+  prepare(sql) {
+    const adapter = this;
+    return {
+      get: (...params) => adapter.get(sql, params),
+      run: (...params) => adapter.run(sql, params),
+      all: (...params) => adapter.query(sql, params),
+    };
+  }
+
   async close() {
     if (this.pool && typeof this.pool.end === 'function') {
       await this.pool.end();
@@ -262,5 +465,11 @@ class PostgreSQLAdapter {
 module.exports = {
   PostgreSQLAdapter,
   sanitizeConnectionString,
-  convertPlaceholders
+  convertPlaceholders,
+  // Schema-initialization locking internals — exported for observability and tests
+  SCHEMA_LOCK_ID,
+  SCHEMA_LOCK_NAMESPACE,
+  parseExpectedSchemaObjects,
+  verifySchemaObjects,
+  describeMissingSchemaObjects
 };

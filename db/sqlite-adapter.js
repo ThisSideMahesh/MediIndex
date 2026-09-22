@@ -130,6 +130,86 @@ class SQLiteAdapter {
       );
       CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+      CREATE TABLE IF NOT EXISTS medicine_redistribution_requests (
+        id                    INTEGER PRIMARY KEY,
+        idempotency_key       TEXT NOT NULL UNIQUE,
+        sender_pharmacy_id    INTEGER NOT NULL REFERENCES pharmacies(id),
+        recipient_pharmacy_id INTEGER NOT NULL REFERENCES pharmacies(id),
+        medicine_id           INTEGER NOT NULL REFERENCES medicines(id),
+        source_batch_id       INTEGER NOT NULL REFERENCES medicine_batches(id),
+        requested_quantity    INTEGER NOT NULL CHECK(requested_quantity > 0),
+        reason                TEXT NOT NULL DEFAULT 'NEAR_EXPIRY_REDISTRIBUTION',
+        request_type          TEXT NOT NULL DEFAULT 'NEAR_EXPIRY'
+                                CHECK(request_type IN ('NEAR_EXPIRY', 'MANUAL')),
+        status                TEXT NOT NULL DEFAULT 'PENDING'
+                                CHECK(status IN ('PENDING', 'ACCEPTED', 'REJECTED', 'CANCELLED', 'COMPLETED')),
+        automatic_request     INTEGER NOT NULL DEFAULT 0,
+        automatic_acceptance  INTEGER NOT NULL DEFAULT 0,
+        days_until_expiry     INTEGER,
+        distance_km           REAL,
+        notes                 TEXT,
+        created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_redistrib_sender    ON medicine_redistribution_requests(sender_pharmacy_id);
+      CREATE INDEX IF NOT EXISTS idx_redistrib_recipient ON medicine_redistribution_requests(recipient_pharmacy_id);
+      CREATE INDEX IF NOT EXISTS idx_redistrib_batch     ON medicine_redistribution_requests(source_batch_id);
+      CREATE INDEX IF NOT EXISTS idx_redistrib_status    ON medicine_redistribution_requests(status);
+
+      -- ── MANUAL MEDICINE REQUESTS (progressive geographic search) ──────────
+      -- Deliberately SEPARATE from medicine_redistribution_requests:
+      --   redistribution = AUTOMATIC near-expiry, 1 sender -> 1 recipient, tied to a batch.
+      --   medicine_requests (+ offers) = MANUAL, 1 request -> N offers, partial coverage,
+      --   no source batch.
+      -- Cross-pharmacy medicine identity uses lower(medicine_name) because medicines.id
+      -- is per-pharmacy. MVP therefore requires identical medicine naming across pharmacies.
+      -- No inventory is ever moved by these tables.
+      CREATE TABLE IF NOT EXISTS medicine_requests (
+        id                    INTEGER PRIMARY KEY,
+        idempotency_key       TEXT NOT NULL UNIQUE,
+        requester_pharmacy_id INTEGER NOT NULL REFERENCES pharmacies(id),
+        medicine_id           INTEGER NOT NULL REFERENCES medicines(id),
+        medicine_name         TEXT NOT NULL,
+        requested_quantity    INTEGER NOT NULL CHECK(requested_quantity > 0),
+        covered_quantity      INTEGER NOT NULL DEFAULT 0 CHECK(covered_quantity >= 0),
+        status                TEXT NOT NULL DEFAULT 'OPEN'
+                                CHECK(status IN ('OPEN', 'PARTIALLY_COVERED', 'FULLY_COVERED',
+                                                 'NO_COVERAGE', 'CANCELLED', 'EXPIRED')),
+        priority              TEXT NOT NULL DEFAULT 'NORMAL'
+                                CHECK(priority IN ('NORMAL', 'URGENT')),
+        reason                TEXT,
+        current_zone_index    INTEGER NOT NULL DEFAULT 0,
+        current_radius_km     REAL NOT NULL,
+        created_by            INTEGER NOT NULL REFERENCES users(id),
+        expires_at            TEXT NOT NULL,
+        created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT ck_mreq_coverage CHECK(covered_quantity <= requested_quantity)
+      );
+      CREATE INDEX IF NOT EXISTS idx_mreq_requester ON medicine_requests(requester_pharmacy_id, status);
+      CREATE INDEX IF NOT EXISTS idx_mreq_status    ON medicine_requests(status, expires_at);
+      CREATE INDEX IF NOT EXISTS idx_mreq_medicine  ON medicine_requests(medicine_id);
+      CREATE TABLE IF NOT EXISTS medicine_request_offers (
+        id                      INTEGER PRIMARY KEY,
+        request_id              INTEGER NOT NULL REFERENCES medicine_requests(id),
+        pharmacy_id             INTEGER NOT NULL REFERENCES pharmacies(id),
+        zone_index              INTEGER NOT NULL,
+        distance_km             REAL NOT NULL,
+        usable_stock_at_contact INTEGER NOT NULL,
+        status                  TEXT NOT NULL DEFAULT 'PENDING'
+                                  CHECK(status IN ('PENDING', 'ACCEPTED', 'DECLINED',
+                                                   'SUPERSEDED', 'EXPIRED')),
+        offered_quantity        INTEGER CHECK(offered_quantity IS NULL OR offered_quantity > 0),
+        decline_reason          TEXT,
+        responded_by            INTEGER REFERENCES users(id),
+        responded_at            TEXT,
+        respond_by              TEXT NOT NULL,
+        contacted_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_mreq_offer UNIQUE (request_id, pharmacy_id),
+        CONSTRAINT ck_mreq_offer_accepted_qty CHECK(status <> 'ACCEPTED' OR offered_quantity IS NOT NULL)
+      );
+      CREATE INDEX IF NOT EXISTS idx_mreq_offer_request  ON medicine_request_offers(request_id, status);
+      CREATE INDEX IF NOT EXISTS idx_mreq_offer_pharmacy ON medicine_request_offers(pharmacy_id, status);
     `);
   }
 
@@ -143,6 +223,105 @@ class SQLiteAdapter {
       if (!cols.includes('customer_name')) this.db.exec('ALTER TABLE sales ADD COLUMN customer_name TEXT');
       if (!cols.includes('customer_phone')) this.db.exec('ALTER TABLE sales ADD COLUMN customer_phone TEXT');
       if (!cols.includes('payment_method')) this.db.exec("ALTER TABLE sales ADD COLUMN payment_method TEXT NOT NULL DEFAULT 'CASH'");
+
+      // Add geographic coordinates to pharmacies (nullable — existing rows keep NULL)
+      const pharmCols = this.db.prepare('PRAGMA table_info(pharmacies)').all().map(c => c.name);
+      if (!pharmCols.includes('latitude'))  this.db.exec('ALTER TABLE pharmacies ADD COLUMN latitude  REAL');
+      if (!pharmCols.includes('longitude')) this.db.exec('ALTER TABLE pharmacies ADD COLUMN longitude REAL');
+      // Pharmacy activation flag. DEFAULT 1 means every existing pharmacy becomes
+      // active automatically — no backfill, no row invalidated.
+      if (!pharmCols.includes('active')) {
+        this.db.exec('ALTER TABLE pharmacies ADD COLUMN active INTEGER NOT NULL DEFAULT 1');
+      }
+
+      // Medicine redistribution requests table (additive — safe for existing DBs)
+      const tables = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(t => t.name);
+      if (!tables.includes('medicine_redistribution_requests')) {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS medicine_redistribution_requests (
+            id                    INTEGER PRIMARY KEY,
+            idempotency_key       TEXT NOT NULL UNIQUE,
+            sender_pharmacy_id    INTEGER NOT NULL REFERENCES pharmacies(id),
+            recipient_pharmacy_id INTEGER NOT NULL REFERENCES pharmacies(id),
+            medicine_id           INTEGER NOT NULL REFERENCES medicines(id),
+            source_batch_id       INTEGER NOT NULL REFERENCES medicine_batches(id),
+            requested_quantity    INTEGER NOT NULL CHECK(requested_quantity > 0),
+            reason                TEXT NOT NULL DEFAULT 'NEAR_EXPIRY_REDISTRIBUTION',
+            request_type          TEXT NOT NULL DEFAULT 'NEAR_EXPIRY'
+                                    CHECK(request_type IN ('NEAR_EXPIRY', 'MANUAL')),
+            status                TEXT NOT NULL DEFAULT 'PENDING'
+                                    CHECK(status IN ('PENDING', 'ACCEPTED', 'REJECTED', 'CANCELLED', 'COMPLETED')),
+            automatic_request     INTEGER NOT NULL DEFAULT 0,
+            automatic_acceptance  INTEGER NOT NULL DEFAULT 0,
+            days_until_expiry     INTEGER,
+            distance_km           REAL,
+            notes                 TEXT,
+            created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+          );
+          CREATE INDEX IF NOT EXISTS idx_redistrib_sender    ON medicine_redistribution_requests(sender_pharmacy_id);
+          CREATE INDEX IF NOT EXISTS idx_redistrib_recipient ON medicine_redistribution_requests(recipient_pharmacy_id);
+          CREATE INDEX IF NOT EXISTS idx_redistrib_batch     ON medicine_redistribution_requests(source_batch_id);
+          CREATE INDEX IF NOT EXISTS idx_redistrib_status    ON medicine_redistribution_requests(status);
+        `);
+      }
+
+      // Manual medicine request tables (additive — safe for existing DBs).
+      // Separate from medicine_redistribution_requests by design; see applySchema().
+      if (!tables.includes('medicine_requests')) {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS medicine_requests (
+            id                    INTEGER PRIMARY KEY,
+            idempotency_key       TEXT NOT NULL UNIQUE,
+            requester_pharmacy_id INTEGER NOT NULL REFERENCES pharmacies(id),
+            medicine_id           INTEGER NOT NULL REFERENCES medicines(id),
+            medicine_name         TEXT NOT NULL,
+            requested_quantity    INTEGER NOT NULL CHECK(requested_quantity > 0),
+            covered_quantity      INTEGER NOT NULL DEFAULT 0 CHECK(covered_quantity >= 0),
+            status                TEXT NOT NULL DEFAULT 'OPEN'
+                                    CHECK(status IN ('OPEN', 'PARTIALLY_COVERED', 'FULLY_COVERED',
+                                                     'NO_COVERAGE', 'CANCELLED', 'EXPIRED')),
+            priority              TEXT NOT NULL DEFAULT 'NORMAL'
+                                    CHECK(priority IN ('NORMAL', 'URGENT')),
+            reason                TEXT,
+            current_zone_index    INTEGER NOT NULL DEFAULT 0,
+            current_radius_km     REAL NOT NULL,
+            created_by            INTEGER NOT NULL REFERENCES users(id),
+            expires_at            TEXT NOT NULL,
+            created_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT ck_mreq_coverage CHECK(covered_quantity <= requested_quantity)
+          );
+          CREATE INDEX IF NOT EXISTS idx_mreq_requester ON medicine_requests(requester_pharmacy_id, status);
+          CREATE INDEX IF NOT EXISTS idx_mreq_status    ON medicine_requests(status, expires_at);
+          CREATE INDEX IF NOT EXISTS idx_mreq_medicine  ON medicine_requests(medicine_id);
+        `);
+      }
+      if (!tables.includes('medicine_request_offers')) {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS medicine_request_offers (
+            id                      INTEGER PRIMARY KEY,
+            request_id              INTEGER NOT NULL REFERENCES medicine_requests(id),
+            pharmacy_id             INTEGER NOT NULL REFERENCES pharmacies(id),
+            zone_index              INTEGER NOT NULL,
+            distance_km             REAL NOT NULL,
+            usable_stock_at_contact INTEGER NOT NULL,
+            status                  TEXT NOT NULL DEFAULT 'PENDING'
+                                      CHECK(status IN ('PENDING', 'ACCEPTED', 'DECLINED',
+                                                       'SUPERSEDED', 'EXPIRED')),
+            offered_quantity        INTEGER CHECK(offered_quantity IS NULL OR offered_quantity > 0),
+            decline_reason          TEXT,
+            responded_by            INTEGER REFERENCES users(id),
+            responded_at            TEXT,
+            respond_by              TEXT NOT NULL,
+            contacted_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT uq_mreq_offer UNIQUE (request_id, pharmacy_id),
+            CONSTRAINT ck_mreq_offer_accepted_qty CHECK(status <> 'ACCEPTED' OR offered_quantity IS NOT NULL)
+          );
+          CREATE INDEX IF NOT EXISTS idx_mreq_offer_request  ON medicine_request_offers(request_id, status);
+          CREATE INDEX IF NOT EXISTS idx_mreq_offer_pharmacy ON medicine_request_offers(pharmacy_id, status);
+        `);
+      }
     } catch {}
   }
 
@@ -193,11 +372,11 @@ class SQLiteAdapter {
     this.db.exec('ROLLBACK');
   }
 
-  transaction(callback, isImmediate = false) {
+  async transaction(callback, isImmediate = false) {
     const startSql = isImmediate ? 'BEGIN IMMEDIATE' : 'BEGIN';
     this.db.exec(startSql);
     try {
-      const result = callback(this);
+      const result = await callback(this);
       this.db.exec('COMMIT');
       return result;
     } catch (err) {

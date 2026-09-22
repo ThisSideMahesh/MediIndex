@@ -22,8 +22,36 @@ const formatValue = (key, value) => key === 'todaySales' ? formatCurrency(value)
 
 async function api(path, options) {
   const response = await fetch(path, options);
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || 'Request failed');
+
+  // Read the body as text first — never assume it's JSON. A non-2xx response
+  // from an auth gateway, a Vercel error page, or an unhandled crash can return
+  // HTML or plain text, and calling response.json() directly on that throws a
+  // misleading "Unexpected token..." parse error instead of a useful message.
+  const raw = await response.text();
+  const contentType = response.headers.get('content-type') || '';
+  const looksLikeJson = contentType.includes('application/json');
+
+  let data = null;
+  if (looksLikeJson && raw) {
+    try { data = JSON.parse(raw); } catch { data = null; }
+  }
+
+  if (!response.ok) {
+    // Prefer the server's own error message when we successfully parsed JSON.
+    if (data && typeof data.error === 'string' && data.error) throw new Error(data.error);
+    if (response.status === 401) throw new Error('Your session has expired. Please sign in again.');
+    if (response.status === 403) throw new Error('You do not have permission for this action.');
+    if (response.status === 404) throw new Error('The requested resource was not found.');
+    if (response.status >= 500) throw new Error('The server is temporarily unavailable. Please try again.');
+    throw new Error(`Request failed (HTTP ${response.status}).`);
+  }
+
+  // Success status but the body wasn't parseable JSON — never expose raw
+  // HTML/text to the user; fail with a clear, generic message instead.
+  if (!looksLikeJson || data === null) {
+    throw new Error('The server returned an unexpected response.');
+  }
+
   return data;
 }
 
@@ -33,6 +61,53 @@ function openDialog(id) {
 
 function closeDialog(id) {
   document.querySelector(`#${id}`).close();
+}
+
+// ----------------------------------------------------
+// SERVER TIMESTAMP NORMALIZATION
+//
+// The API returns two timestamp shapes depending on the database engine:
+//   * engine-written values (expiresAt, respondBy) are always full ISO-8601 UTC
+//     e.g. "2026-09-24T17:57:25.064Z"
+//   * database-generated values (createdAt, updatedAt, contactedAt, requestedAt)
+//     come from CURRENT_TIMESTAMP. PostgreSQL returns ISO-8601 UTC, but SQLite
+//     returns a NAIVE UTC string e.g. "2026-09-21 17:57:25" with no zone marker.
+//
+// `new Date("2026-09-21 17:57:25")` is interpreted as LOCAL time by the browser,
+// which silently shifts the value by the viewer's UTC offset. Everything that
+// needs a timestamp must therefore go through parseServerTime().
+// ----------------------------------------------------
+function parseServerTime(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  const text = String(value).trim();
+  // Already carries a zone designator (Z or ±HH:MM / ±HHMM) — safe to parse.
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(text);
+  const iso = hasZone ? text.replace(' ', 'T') : `${text.replace(' ', 'T')}Z`;
+  const parsed = new Date(iso);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+/** "23h 41m", "7h 12m", "18m", or null when already elapsed/unknown. */
+function formatRemaining(value, now = Date.now()) {
+  const date = parseServerTime(value);
+  if (!date) return null;
+  const ms = date.getTime() - now;
+  if (ms <= 0) return null;
+  const totalMinutes = Math.floor(ms / 60000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+/** Local-time display string for a server timestamp, or an em dash. */
+function formatServerTime(value) {
+  const date = parseServerTime(value);
+  if (!date) return '—';
+  return date.toLocaleString();
 }
 
 function escapeHtml(value) {
@@ -57,6 +132,65 @@ async function showApp(user) {
   await refreshDashboard();
   loginView.hidden = true;
   appView.hidden = false;
+
+  // Show admin-only nav items
+  document.querySelectorAll('.admin-only-nav').forEach(btn => {
+    btn.hidden = (user.role !== 'ADMIN');
+  });
+
+  // In-app incoming medicine-request indicator. Fetched once on sign-in using the
+  // existing request pattern — no polling loop, timer or background worker.
+  refreshMedicineRequestBadge();
+
+  // Initialise client-side sync module
+  if (window.MediSync) {
+    document.querySelector('#sync-status').hidden = false;
+    await window.MediSync.init(({ status, pending, failed }) => {
+      const el = document.querySelector('#sync-status');
+      const icon = document.querySelector('#sync-icon');
+      const label = document.querySelector('#sync-label');
+      const pendingEl = document.querySelector('#sync-pending');
+
+      // Remove all state classes
+      el.classList.remove('is-online', 'is-offline', 'is-syncing', 'is-synced', 'is-failed');
+
+      switch (status) {
+        case 'online':
+          el.classList.add('is-online');
+          icon.textContent = '●';
+          label.textContent = 'Online';
+          pendingEl.hidden = true;
+          break;
+        case 'offline':
+          el.classList.add('is-offline');
+          icon.textContent = '◌';
+          label.textContent = pending > 0 ? 'Offline — changes will sync automatically' : 'Offline';
+          if (pending > 0) { pendingEl.textContent = `${pending} pending`; pendingEl.hidden = false; }
+          else pendingEl.hidden = true;
+          break;
+        case 'syncing':
+          el.classList.add('is-syncing');
+          icon.textContent = '↻';
+          label.textContent = `Syncing${pending > 0 ? ` ${pending} change${pending === 1 ? '' : 's'}` : ''}…`;
+          pendingEl.hidden = true;
+          break;
+        case 'synced':
+          el.classList.add('is-synced');
+          icon.textContent = '✓';
+          label.textContent = 'Synced';
+          pendingEl.hidden = true;
+          break;
+        case 'failed':
+          el.classList.add('is-failed');
+          icon.textContent = '✕';
+          label.textContent = `Sync failed`;
+          const cnt = (pending || 0) + (failed || 0);
+          if (cnt > 0) { pendingEl.textContent = `${cnt} pending`; pendingEl.hidden = false; }
+          else pendingEl.hidden = true;
+          break;
+      }
+    });
+  }
 }
 
 function switchView(view) {
@@ -67,12 +201,18 @@ function switchView(view) {
   document.querySelector('#analytics-view').hidden = view !== 'analytics';
   document.querySelector('#store-map-view').hidden = view !== 'store-map';
   document.querySelector('#expiry-view').hidden = view !== 'expiry';
+  document.querySelector('#redistribution-view').hidden = view !== 'redistribution';
+  document.querySelector('#medicine-requests-view').hidden = view !== 'medicine-requests';
+  document.querySelector('#mobile-devices-view').hidden = view !== 'mobile-devices';
 
   if (view === 'inventory') loadMedicines();
   if (view === 'billing') loadBillingView();
   if (view === 'analytics') loadAnalyticsView();
   if (view === 'store-map') loadStoreMapView();
   if (view === 'expiry') loadAlerts();
+  if (view === 'redistribution') loadRedistributionRequests();
+  if (view === 'medicine-requests') loadMedicineRequestsView();
+  if (view === 'mobile-devices') loadMobileDevices();
 }
 
 // ----------------------------------------------------
@@ -116,6 +256,43 @@ async function loadMedicines() {
     document.querySelector('#medicine-list').innerHTML = medicines.length
       ? medicines.map(medicineCard).join('')
       : '<section class="panel empty"><h3>No medicines yet</h3><p>Add a medicine, then add its batch stock.</p></section>';
+  } catch (error) {
+    document.querySelector('#inventory-error').textContent = error.message;
+  }
+  // Show/hide inactive toggle for admins
+  const toggleRow = document.querySelector('#inactive-toggle-row');
+  if (toggleRow) toggleRow.style.display = currentUser && currentUser.role === 'ADMIN' ? 'block' : 'none';
+}
+
+function inactiveMedicineCard(medicine) {
+  return `
+    <article class="medicine-card inactive-medicine-card">
+      <div class="medicine-main">
+        <div>
+          <h3>${escapeHtml(medicine.name)} <span class="badge warning" style="font-size:0.65rem;vertical-align:middle">INACTIVE</span></h3>
+          <p>${escapeHtml(medicine.generic_name || 'No generic name')} · ${escapeHtml(medicine.manufacturer || 'Manufacturer not specified')}</p>
+        </div>
+        <span class="stock">${medicine.total_stock} units on-hand</span>
+      </div>
+      <div class="medicine-meta">
+        <span>${escapeHtml(medicine.category || 'Uncategorised')}</span>
+        <span>Minimum: ${medicine.minimum_stock}</span>
+        <span class="muted">Deactivated</span>
+      </div>
+      <div class="card-actions">
+        <button class="secondary" data-reactivate="${medicine.id}">Reactivate</button>
+      </div>
+    </article>
+  `;
+}
+
+async function loadInactiveMedicines() {
+  const container = document.querySelector('#inactive-medicine-list');
+  try {
+    const response = await api('/api/medicines/inactive');
+    container.innerHTML = response.medicines.length
+      ? response.medicines.map(inactiveMedicineCard).join('')
+      : '<section class="panel empty"><h3>No inactive medicines</h3><p>Deactivated medicines will appear here.</p></section>';
   } catch (error) {
     document.querySelector('#inventory-error').textContent = error.message;
   }
@@ -312,6 +489,15 @@ async function handleCheckout(event) {
   const errorEl = document.querySelector('#pos-checkout-error');
   const submitBtn = document.querySelector('#pos-checkout-btn');
   errorEl.textContent = '';
+
+  // POS/billing is intentionally online-only — FEFO requires live server inventory
+  if (window.MediSync) {
+    const { status } = window.MediSync.getStatus();
+    if (status === 'offline') {
+      errorEl.textContent = 'This operation requires an Internet connection. Billing and sales cannot be processed offline.';
+      return;
+    }
+  }
 
   if (billingCart.length === 0) {
     errorEl.textContent = 'Cart is empty.';
@@ -590,7 +776,20 @@ async function openQrSticker(batchId) {
     document.querySelector('#qr-sticker-raw-payload').textContent = res.payloadString;
 
     const svgWrapper = document.querySelector('#qr-sticker-svg-wrapper');
-    svgWrapper.innerHTML = window.QRCodeGenerator ? window.QRCodeGenerator.generateSVG(res.payloadString, 4) : '<span>QR Generator Ready</span>';
+    
+    // Fetch QR from server endpoint (proven qrcode library)
+    try {
+      const qrResponse = await fetch(`/api/qr/generate?payload=${encodeURIComponent(res.payloadString)}`);
+      
+      if (!qrResponse.ok) {
+        throw new Error(`QR generation failed: ${qrResponse.status}`);
+      }
+      const svg = await qrResponse.text();
+      svgWrapper.innerHTML = svg;
+    } catch (qrErr) {
+      console.error('QR generation error:', qrErr);
+      svgWrapper.innerHTML = '<div style="color: #d32f2f; padding: 1rem;">QR generation failed. Please try again.</div>';
+    }
 
     openDialog('qr-sticker-dialog');
   } catch (err) {
@@ -988,6 +1187,33 @@ document.querySelector('#medicine-search').addEventListener('input', () => {
   window.searchTimer = setTimeout(loadMedicines, 180);
 });
 
+document.querySelector('#toggle-inactive-btn').addEventListener('click', async () => {
+  const section = document.querySelector('#inactive-medicines-section');
+  const btn = document.querySelector('#toggle-inactive-btn');
+  if (!section.hidden) {
+    section.hidden = true;
+    btn.textContent = 'Show inactive medicines';
+  } else {
+    await loadInactiveMedicines();
+    section.hidden = false;
+    btn.textContent = 'Hide inactive medicines';
+  }
+});
+
+document.querySelector('#inactive-medicine-list').addEventListener('click', async event => {
+  const id = Number(event.target.dataset.reactivate);
+  if (!id) return;
+  if (!confirm('Reactivate this medicine? It will be restored to the active catalogue.')) return;
+  try {
+    await api(`/api/medicines/${id}/reactivate`, { method: 'POST' });
+    await loadMedicines();
+    await loadInactiveMedicines();
+    await refreshDashboard();
+  } catch (error) {
+    document.querySelector('#inventory-error').textContent = error.message;
+  }
+});
+
 document.querySelector('#add-medicine').addEventListener('click', () => {
   if (currentUser.role !== 'ADMIN') {
     document.querySelector('#inventory-error').textContent = 'Only an administrator can create medicines.';
@@ -1064,7 +1290,7 @@ document.querySelector('#medicine-form').addEventListener('submit', async event 
 
 document.querySelector('#batch-form').addEventListener('submit', async event => {
   event.preventDefault();
-  const id = document.querySelector('#batch-medicine-id').value;
+  const medicineId = document.querySelector('#batch-medicine-id').value;
   const body = {
     batchNumber: document.querySelector('#batch-number').value,
     quantity: document.querySelector('#batch-quantity').value,
@@ -1074,8 +1300,24 @@ document.querySelector('#batch-form').addEventListener('submit', async event => 
     expiryDate: document.querySelector('#batch-expiry').value,
     location: document.querySelector('#batch-location').value
   };
+  const errorEl = document.querySelector('#batch-form-error');
+  errorEl.textContent = '';
+
+  // --- Offline guard: creating a new batch requires an Internet connection.
+  // The offline /api/sync/stock-receipt endpoint handles ADDITIONS to an existing batch,
+  // not new batch creation (which requires selling price, expiry date, location, etc.).
+  // Show a clear message rather than queuing a doomed operation.
+  if (window.MediSync) {
+    const { status } = window.MediSync.getStatus();
+    if (status === 'offline') {
+      errorEl.textContent = 'Adding a new batch requires an Internet connection. Please reconnect and try again.';
+      return;
+    }
+  }
+
+  // Online: use the existing batch-creation endpoint
   try {
-    await api(`/api/medicines/${id}/batches`, {
+    await api(`/api/medicines/${medicineId}/batches`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
@@ -1084,7 +1326,7 @@ document.querySelector('#batch-form').addEventListener('submit', async event => 
     await loadMedicines();
     await refreshDashboard();
   } catch (error) {
-    document.querySelector('#batch-form-error').textContent = error.message;
+    errorEl.textContent = error.message;
   }
 });
 
@@ -1113,6 +1355,46 @@ document.querySelector('#forecast-search').addEventListener('input', () => {
 document.querySelector('#forecast-table').addEventListener('click', event => {
   const medicineId = Number(event.target.dataset.viewForecast);
   if (medicineId) openForecastDetails(medicineId);
+});
+
+// Store Layout (2D) Listeners
+document.querySelector('#refresh-store-map').addEventListener('click', async () => {
+  await loadStoreMapView();
+});
+
+document.querySelector('#map-medicine-search').addEventListener('input', () => {
+  clearTimeout(window.mapSearchTimer);
+  window.mapSearchTimer = setTimeout(() => {
+    highlightMedicineOnMap(document.querySelector('#map-medicine-search').value);
+  }, 180);
+});
+
+document.querySelector('#map-clear-search-btn').addEventListener('click', () => {
+  document.querySelector('#map-medicine-search').value = '';
+  highlightMedicineOnMap('');
+});
+
+// Shelf node click — select shelf and update inspector
+document.querySelector('.floor-plan-panel').addEventListener('click', event => {
+  const node = event.target.closest('.shelf-node');
+  if (!node) return;
+  const shelfId = node.dataset.shelfId;
+  if (shelfId) selectShelf(shelfId);
+});
+
+// Bill button inside inspector — navigate to POS and pre-fill
+document.querySelector('#inspector-body').addEventListener('click', async event => {
+  const batchId = event.target.dataset.billBatch;
+  const medId = event.target.dataset.medId;
+  if (!batchId || !medId) return;
+  switchView('billing');
+  await loadBillingView();
+  const medSelect = document.querySelector('#pos-medicine-select');
+  medSelect.value = medId;
+  await onMedicineChange();
+  document.querySelector('#pos-batch-select').value = batchId;
+  document.querySelector('#pos-quantity').value = 1;
+  addCartItem();
 });
 
 // QR Specific Listeners
@@ -1159,5 +1441,813 @@ document.querySelectorAll('[data-close]').forEach(button => {
   button.addEventListener('click', () => closeDialog(button.dataset.close));
 });
 
+// ----------------------------------------------------
+// NEAR-EXPIRY REDISTRIBUTION
+// ----------------------------------------------------
+
+async function loadRedistributionRequests() {
+  const role   = document.querySelector('#redistrib-role-filter').value;
+  const status = document.querySelector('#redistrib-status-filter').value;
+  const errorEl = document.querySelector('#redistribution-error');
+  errorEl.textContent = '';
+  try {
+    const res = await api(`/api/inter-pharmacy/requests?role=${role}&status=${status}`);
+    const tbody = document.querySelector('#redistribution-body');
+    if (!res.requests || res.requests.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="12" class="muted text-center">No redistribution requests found.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = res.requests.map(r => {
+      const autoBadge = r.automatic_request
+        ? '<span class="badge badge-auto">AUTO</span>'
+        : '<span class="badge">MANUAL</span>';
+      const statusClass = `badge-${(r.status || '').toLowerCase()}`;
+      const dist = r.distance_km != null ? `${r.distance_km} km` : '—';
+      return `
+        <tr>
+          <td><code>#${r.id}</code></td>
+          <td><strong>${escapeHtml(r.medicine_name)}</strong><div class="muted font-xs">${escapeHtml(r.generic_name || '')}</div></td>
+          <td><code>${escapeHtml(r.batch_number)}</code></td>
+          <td>${escapeHtml(r.sender_name)}</td>
+          <td>${escapeHtml(r.recipient_name)}</td>
+          <td><strong>${r.requested_quantity}u</strong></td>
+          <td><span class="${r.days_until_expiry <= 7 ? 'text-danger' : ''}">${r.days_until_expiry ?? '—'}</span></td>
+          <td>${dist}</td>
+          <td><span class="badge ${statusClass}">${r.status}</span></td>
+          <td>${autoBadge}</td>
+          <td>${escapeHtml(r.created_at ? r.created_at.slice(0,10) : '')}</td>
+          <td>
+            ${r.status === 'ACCEPTED' ? `<button class="secondary small-btn" data-redistrib-complete="${r.id}">Complete</button>` : ''}
+            ${['PENDING','ACCEPTED'].includes(r.status) ? `<button class="danger small-btn" data-redistrib-cancel="${r.id}">Cancel</button>` : ''}
+          </td>
+        </tr>
+      `;
+    }).join('');
+  } catch (err) {
+    errorEl.textContent = err.message;
+  }
+}
+
+// Redistribution event listeners
+document.querySelector('#run-redistribution-btn').addEventListener('click', async () => {
+  const btn = document.querySelector('#run-redistribution-btn');
+  const resultEl = document.querySelector('#redistribution-scan-result');
+  const errorEl  = document.querySelector('#redistribution-error');
+  errorEl.textContent = '';
+  btn.disabled = true;
+  btn.textContent = 'Scanning…';
+  try {
+    const res = await api('/api/inter-pharmacy/near-expiry/process', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+    resultEl.className = `redistrib-scan-result${res.created === 0 ? ' no-action' : ''}`;
+    resultEl.innerHTML = res.created > 0
+      ? `<strong>✓ ${res.created} redistribution request${res.created === 1 ? '' : 's'} created and auto-accepted.</strong> ` +
+        `Skipped: ${res.skippedDuplicate} duplicates, ${res.skippedNoCoordinates} without coordinates, ${res.skippedSufficientStock} with sufficient stock. ` +
+        `Threshold: ${res.nearExpiryDays} days · Radius: ${res.nearbyRadiusKm} km.`
+      : `No new requests created. Skipped: ${res.skippedDuplicate} duplicates, ${res.skippedNoCoordinates} without coordinates, ${res.skippedSufficientStock} with sufficient stock. ` +
+        `(Threshold: ${res.nearExpiryDays} days · Radius: ${res.nearbyRadiusKm} km)`;
+    resultEl.hidden = false;
+    await loadRedistributionRequests();
+  } catch (err) {
+    errorEl.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Run Near-Expiry Scan';
+  }
+});
+
+document.querySelector('#refresh-redistribution-btn').addEventListener('click', loadRedistributionRequests);
+document.querySelector('#redistrib-role-filter').addEventListener('change', loadRedistributionRequests);
+document.querySelector('#redistrib-status-filter').addEventListener('change', loadRedistributionRequests);
+
+document.querySelector('#redistribution-body').addEventListener('click', async event => {
+  const completeId = event.target.dataset.redistribComplete;
+  const cancelId   = event.target.dataset.redistribCancel;
+  const id = completeId || cancelId;
+  if (!id) return;
+  const newStatus = completeId ? 'COMPLETED' : 'CANCELLED';
+  try {
+    await api(`/api/inter-pharmacy/requests/${id}/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: newStatus })
+    });
+    await loadRedistributionRequests();
+  } catch (err) {
+    document.querySelector('#redistribution-error').textContent = err.message;
+  }
+});
+
+// ----------------------------------------------------
+// MOBILE DEVICES (ADMIN-only pairing & device management)
+// ----------------------------------------------------
+
+/**
+ * Note: the device token returned by /api/mobile/pairing/complete is issued to
+ * the Android app directly during pairing — the web dashboard never receives
+ * or displays it. Only the one-time pairing CODE (not the device token) is
+ * shown here, because the admin must hand it to the person pairing the device.
+ */
+async function loadMobileDevices() {
+  const errorEl = document.querySelector('#devices-list-error');
+  const tbody = document.querySelector('#devices-body');
+  errorEl.textContent = '';
+  try {
+    const res = await api('/api/mobile/devices');
+    if (!res.devices || res.devices.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="muted text-center">No devices paired yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = res.devices.map(d => {
+      const statusBadge = d.revoked === 1
+        ? '<span class="badge badge-rejected">REVOKED</span>'
+        : '<span class="badge badge-accepted">ACTIVE</span>';
+      return `
+        <tr>
+          <td><strong>${escapeHtml(d.device_name)}</strong></td>
+          <td>${escapeHtml(d.device_model || '—')}</td>
+          <td>${formatServerTime(d.created_at)}</td>
+          <td>${d.last_seen_at ? formatServerTime(d.last_seen_at) : '—'}</td>
+          <td>${statusBadge}</td>
+          <td>
+            ${d.revoked === 1 ? '' : `<button class="danger small-btn" data-device-revoke="${d.id}">Revoke</button>`}
+          </td>
+        </tr>
+      `;
+    }).join('');
+  } catch (err) {
+    errorEl.textContent = err.message;
+    tbody.innerHTML = '<tr><td colspan="6" class="muted text-center">Unable to load devices.</td></tr>';
+  }
+}
+
+document.querySelector('#generate-pairing-code-btn').addEventListener('click', async () => {
+  const btn = document.querySelector('#generate-pairing-code-btn');
+  const errorEl = document.querySelector('#pairing-generate-error');
+  const resultEl = document.querySelector('#pairing-code-result');
+  errorEl.textContent = '';
+  btn.disabled = true;
+  btn.textContent = 'Generating…';
+  try {
+    const res = await api('/api/mobile/pairing/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    document.querySelector('#pairing-code-value').textContent = res.pairingCode;
+    const remaining = formatRemaining(res.expiresAt);
+    document.querySelector('#pairing-code-expiry').textContent = remaining
+      ? `This code is one-time use and expires in ${remaining}.`
+      : 'This code is one-time use and expires shortly.';
+    resultEl.hidden = false;
+  } catch (err) {
+    errorEl.textContent = err.message;
+    resultEl.hidden = true;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Generate Pairing Code';
+  }
+});
+
+document.querySelector('#refresh-devices-btn').addEventListener('click', loadMobileDevices);
+
+document.querySelector('#devices-body').addEventListener('click', async event => {
+  const deviceId = event.target.dataset.deviceRevoke;
+  if (!deviceId) return;
+  const button = event.target;
+  const errorEl = document.querySelector('#devices-list-error');
+  errorEl.textContent = '';
+  if (!confirm('Revoke this device? It will no longer be able to sync or authenticate.')) return;
+  button.disabled = true;
+  try {
+    await api(`/api/mobile/devices/${deviceId}/revoke`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    await loadMobileDevices();
+  } catch (err) {
+    errorEl.textContent = err.message;
+    button.disabled = false;
+  }
+});
+
 // Initial session check
 api('/api/auth/me').then(({ user }) => showApp(user)).catch(() => {});
+
+// ====================================================
+// MANUAL MEDICINE REQUESTS (progressive geographic search)
+//
+// A separate workflow from the automatic Near-Expiry Redistribution view.
+// All rules — eligibility, proximity, usable/offerable stock, coverage,
+// zone expansion — are decided by the server. This module renders what the API
+// returns and never recomputes availability locally.
+//
+// Offering or accepting records a COMMITMENT. No inventory is moved here.
+// ====================================================
+
+const MREQ_API = '/api/inter-pharmacy/medicine-requests';
+let mreqActiveTab = 'mine';
+let mreqDetailId = null;
+let mreqCreateKey = null;      // reused across retries so a retry stays idempotent
+let mreqBusy = false;          // guards against duplicate submissions
+
+const MREQ_STATUS_LABELS = {
+  OPEN: 'OPEN',
+  PARTIALLY_COVERED: 'PARTIALLY COVERED',
+  FULLY_COVERED: 'FULLY COVERED',
+  NO_COVERAGE: 'NO COVERAGE',
+  CANCELLED: 'CANCELLED',
+  EXPIRED: 'EXPIRED'
+};
+const MREQ_OFFER_LABELS = {
+  PENDING: 'PENDING',
+  ACCEPTED: 'ACCEPTED',
+  DECLINED: 'DECLINED',
+  SUPERSEDED: 'SUPERSEDED',
+  EXPIRED: 'EXPIRED'
+};
+
+// Mirrors CANCELLABLE_REQUEST_STATUSES in medicine-requests.js. Kept in sync so
+// the UI never offers an action the server would reject, and never hides one it
+// would accept. EXPIRED is excluded (final); CANCELLED is already cancelled.
+const MREQ_CANCELLABLE_STATUSES = ['OPEN', 'PARTIALLY_COVERED', 'FULLY_COVERED', 'NO_COVERAGE'];
+
+/**
+ * Whether the requester may cancel a request from the UI.
+ *
+ * Only the requesting pharmacy, and only while the backend would still accept a
+ * cancellation. A request keeps its record and its 72-hour lifetime after the
+ * search finishes, so NO_COVERAGE and FULLY_COVERED remain cancellable — the
+ * requester can close the request out instead of waiting for it to expire.
+ * The backend remains authoritative and re-checks on every call; this is a
+ * display gate only, kept exactly as wide as the server rule.
+ */
+function mreqCanCancel(status, isRequester) {
+  return isRequester === true && MREQ_CANCELLABLE_STATUSES.includes(status);
+}
+
+function mreqStatusBadge(status) {
+  const key = String(status || '').toLowerCase();
+  const label = MREQ_STATUS_LABELS[status] || MREQ_OFFER_LABELS[status] || status || '—';
+  return `<span class="badge mreq-badge-${key}">${escapeHtml(label)}</span>`;
+}
+
+function mreqSetError(message) {
+  document.querySelector('#mreq-error').textContent = message || '';
+}
+
+/** Requirement: medicine requests are not offline-capable and are never queued. */
+function mreqOffline() {
+  const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
+  const note = document.querySelector('#mreq-offline-note');
+  if (note) note.hidden = !offline;
+  return offline;
+}
+
+function mreqNewIdempotencyKey() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  return `mreq-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+/**
+ * Progressive-search summary built strictly from server-confirmed data:
+ * currentZoneIndex / currentRadiusKm / zoneCount / maxRadiusKm, plus the zones
+ * that actually produced contacts. No zone is claimed as searched unless the
+ * server says so, and a covered request never implies an ongoing search.
+ */
+function mreqSearchProgress(request, offers = []) {
+  const zoneCount = Number(request.zoneCount) || 0;
+  const current = Number(request.currentZoneIndex) || 0;
+  const radius = request.currentRadiusKm;
+  const terminal = ['FULLY_COVERED', 'NO_COVERAGE', 'CANCELLED', 'EXPIRED'].includes(request.status);
+
+  const contactsByZone = new Map();
+  for (const o of offers) {
+    const z = Number(o.zoneIndex);
+    contactsByZone.set(z, (contactsByZone.get(z) || 0) + 1);
+  }
+
+  let headline;
+  if (request.status === 'FULLY_COVERED') headline = 'Fully covered — the search has stopped.';
+  else if (request.status === 'NO_COVERAGE') headline = `No coverage found within the maximum ${escapeHtml(String(request.maxRadiusKm))} km radius.`;
+  else if (request.status === 'CANCELLED') headline = 'Request cancelled — the search has stopped.';
+  else if (request.status === 'EXPIRED') headline = 'Request expired — the search has stopped.';
+  else if (zoneCount && current >= zoneCount - 1) headline = `Maximum search radius reached (${escapeHtml(String(radius))} km).`;
+  else if (current === 0) headline = `Searching within ${escapeHtml(String(radius))} km.`;
+  else headline = `Expanded search to ${escapeHtml(String(radius))} km.`;
+
+  const rows = [];
+  for (let i = 0; i < zoneCount; i++) {
+    const contacts = contactsByZone.get(i) || 0;
+    const reached = i < current || (i === current && (contacts > 0 || !terminal));
+    let state;
+    if (i === current && !terminal) state = `current${radius != null ? ` · ${escapeHtml(String(radius))} km` : ''}`;
+    else if (reached) state = 'reached';
+    else state = 'not reached';
+    const detail = contacts > 0 ? ` · ${contacts} contacted` : '';
+    rows.push(`
+      <li class="mreq-zone ${reached ? 'reached' : ''}">
+        <span class="mreq-zone-dot" aria-hidden="true">${reached ? '●' : '○'}</span>
+        <span>Zone ${i + 1} of ${zoneCount} — ${state}${detail}</span>
+      </li>`);
+  }
+
+  return `
+    <div class="mreq-search">
+      <p class="mreq-search-headline">${headline}</p>
+      <ul class="mreq-zone-list">${rows.join('')}</ul>
+    </div>`;
+}
+
+function mreqCoverageBar(request) {
+  const requested = Number(request.requestedQuantity) || 0;
+  const covered = Number(request.coveredQuantity) || 0;
+  const pct = requested > 0 ? Math.min(100, Math.round((covered / requested) * 100)) : 0;
+  return `
+    <div class="mreq-coverage">
+      <div class="mreq-coverage-figures">
+        <span>Requested <strong>${requested}</strong></span>
+        <span>Covered <strong>${covered}</strong></span>
+        <span>Remaining <strong>${Number(request.remainingQuantity) || 0}</strong></span>
+      </div>
+      <div class="mreq-coverage-track" role="img" aria-label="${covered} of ${requested} units committed">
+        <div class="mreq-coverage-fill" style="width:${pct}%"></div>
+      </div>
+    </div>`;
+}
+
+// ── My Requests ─────────────────────────────────────────────────────────────
+
+function mreqMyCard(request) {
+  const expiresIn = formatRemaining(request.expiresAt);
+  const summary = request.offerSummary || {};
+  const offerCount = Number(summary.contacted) || 0;
+  const accepted = Number((summary.byStatus || {}).ACCEPTED) || 0;
+  const priority = request.priority === 'URGENT' ? '<span class="badge mreq-badge-urgent">URGENT</span>' : '';
+  return `
+    <article class="mreq-card" data-mreq-card="${request.id}">
+      <div class="mreq-card-head">
+        <div>
+          <h3>${escapeHtml(request.medicineName)} ${priority}</h3>
+          <p class="muted font-xs">Request #${request.id} · created ${escapeHtml(formatServerTime(request.createdAt))}</p>
+        </div>
+        ${mreqStatusBadge(request.status)}
+      </div>
+      ${mreqCoverageBar(request)}
+      <div class="mreq-meta">
+        <span>Search radius: <strong>${escapeHtml(String(request.currentRadiusKm))} km</strong></span>
+        <span>Zone <strong>${Number(request.currentZoneIndex) + 1} of ${request.zoneCount}</strong></span>
+        <span>Responses: <strong>${offerCount}</strong>${accepted ? ` (${accepted} accepted)` : ''}</span>
+        <span>${expiresIn ? `Expires in <strong>${expiresIn}</strong>` : 'Expired or closed'}</span>
+      </div>
+      ${request.reason ? `<p class="muted font-xs">Reason: ${escapeHtml(request.reason)}</p>` : ''}
+      <div class="mreq-card-actions">
+        <button type="button" class="secondary small-btn" data-mreq-detail="${request.id}">View offers</button>
+        ${['OPEN', 'PARTIALLY_COVERED'].includes(request.status)
+          ? `<button type="button" class="secondary small-btn" data-mreq-advance="${request.id}">Continue search</button>`
+          : ''}
+        ${mreqCanCancel(request.status, true)
+          ? `<button type="button" class="danger small-btn" data-mreq-cancel="${request.id}">Cancel Request</button>`
+          : ''}
+      </div>
+    </article>`;
+}
+
+async function loadMyMedicineRequests() {
+  const listEl = document.querySelector('#mreq-mine-list');
+  const status = document.querySelector('#mreq-status-filter').value;
+  const medicine = document.querySelector('#mreq-medicine-filter').value.trim();
+  const params = new URLSearchParams();
+  if (status && status !== 'ALL') params.set('status', status);
+  if (medicine) params.set('medicine', medicine);
+  const qs = params.toString();
+  try {
+    const res = await api(`${MREQ_API}${qs ? `?${qs}` : ''}`);
+    if (!res.requests || res.requests.length === 0) {
+      listEl.innerHTML = '<p class="empty">No medicine requests yet. Use “New Request” to ask nearby pharmacies for stock.</p>';
+      return;
+    }
+    listEl.innerHTML = res.requests.map(mreqMyCard).join('');
+  } catch (err) {
+    listEl.innerHTML = '<p class="empty">Could not load your medicine requests.</p>';
+    mreqSetError(err.message);
+  }
+}
+
+// ── Incoming Requests ───────────────────────────────────────────────────────
+
+function mreqIncomingCard(item) {
+  const respondIn = formatRemaining(item.respondBy);
+  // The server is authoritative about whether an offer is possible.
+  const canOffer = item.canOffer === true && Number(item.maxOfferableQuantity) > 0;
+  const max = Number(item.maxOfferableQuantity) || 0;
+  const priority = item.priority === 'URGENT' ? '<span class="badge mreq-badge-urgent">URGENT</span>' : '';
+
+  const offerControls = canOffer
+    ? `<div class="mreq-offer-row">
+         <label class="mreq-offer-label">Offer quantity
+           <input type="number" class="mreq-offer-input" data-mreq-offer-input="${item.requestId}"
+                  min="1" step="1" max="${max}" value="${Math.min(max, Number(item.outstandingQuantity) || max)}"
+                  aria-label="Quantity to offer, maximum ${max}">
+         </label>
+         <span class="muted font-xs">Max ${max}</span>
+         <button type="button" class="small-btn" data-mreq-offer="${item.requestId}">Offer Quantity</button>
+         <button type="button" class="secondary small-btn" data-mreq-decline="${item.requestId}">Decline</button>
+       </div>`
+    : `<div class="mreq-offer-row">
+         <p class="mreq-nostock">You don't have usable stock for this medicine.</p>
+         <button type="button" class="secondary small-btn" data-mreq-decline="${item.requestId}">Decline</button>
+       </div>`;
+
+  return `
+    <article class="mreq-card mreq-incoming" data-mreq-incoming="${item.requestId}">
+      <div class="mreq-card-head">
+        <div>
+          <h3>${escapeHtml(item.medicineName)} ${priority}</h3>
+          <p class="muted font-xs">
+            From ${escapeHtml(item.requesterName)} · ${escapeHtml(String(item.distanceKm))} km away ·
+            requested ${escapeHtml(formatServerTime(item.requestedAt))}
+          </p>
+        </div>
+        ${mreqStatusBadge(item.requestStatus)}
+      </div>
+      <div class="mreq-meta">
+        <span>Requested: <strong>${item.requestedQuantity}</strong></span>
+        <span>Still needed: <strong>${item.outstandingQuantity}</strong></span>
+        <span>Your usable stock: <strong>${item.usableStock}</strong></span>
+        <span>Reserved: <strong>${item.reservedStock}</strong></span>
+        <span>Offerable: <strong>${item.offerableStock}</strong></span>
+        <span>${respondIn ? `Respond within <strong>${respondIn}</strong>` : 'Response window closed'}</span>
+      </div>
+      ${item.reason ? `<p class="muted font-xs">Reason: ${escapeHtml(item.reason)}</p>` : ''}
+      <p class="muted font-xs mreq-commit-note">Offering commits stock for later fulfilment. It does not transfer inventory.</p>
+      <p class="error" data-mreq-row-error="${item.requestId}" role="alert"></p>
+      ${offerControls}
+    </article>`;
+}
+
+async function loadIncomingMedicineRequests() {
+  const listEl = document.querySelector('#mreq-incoming-list');
+  try {
+    const res = await api(`${MREQ_API}/incoming`);
+    mreqUpdateBadge(res.count || 0);
+    if (!res.incoming || res.incoming.length === 0) {
+      listEl.innerHTML = '<p class="empty">No incoming medicine requests.</p>';
+      return;
+    }
+    listEl.innerHTML = res.incoming.map(mreqIncomingCard).join('');
+  } catch (err) {
+    listEl.innerHTML = '<p class="empty">Could not load incoming medicine requests.</p>';
+    mreqSetError(err.message);
+  }
+}
+
+/** In-app indicator only — no push, email, websockets or background workers. */
+function mreqUpdateBadge(count) {
+  for (const id of ['#medicine-requests-badge', '#mreq-incoming-count']) {
+    const el = document.querySelector(id);
+    if (!el) continue;
+    if (count > 0) { el.textContent = String(count); el.hidden = false; }
+    else el.hidden = true;
+  }
+}
+
+/** Refreshes only the badge, using the existing request/refresh pattern. */
+async function refreshMedicineRequestBadge() {
+  if (!currentUser) return;
+  try {
+    const res = await api(`${MREQ_API}/incoming`);
+    mreqUpdateBadge(res.count || 0);
+  } catch { /* badge is advisory only */ }
+}
+
+async function loadMedicineRequestsView() {
+  mreqSetError('');
+  mreqOffline();
+  await Promise.all([
+    mreqActiveTab === 'mine' ? loadMyMedicineRequests() : Promise.resolve(),
+    loadIncomingMedicineRequests()
+  ]);
+  if (mreqActiveTab === 'incoming') await loadMyMedicineRequests();
+  mreqPopulateMedicineOptions();
+}
+
+/** Fills the create-form datalist from the pharmacy's own catalogue. */
+async function mreqPopulateMedicineOptions() {
+  const list = document.querySelector('#mreq-medicine-options');
+  if (!list) return;
+  try {
+    const source = Array.isArray(medicines) && medicines.length ? medicines : (await api('/api/medicines')).medicines || [];
+    list.innerHTML = source.map(m => `<option value="${escapeHtml(m.name)}"></option>`).join('');
+  } catch { /* the field remains free text */ }
+}
+
+// ── Request detail ──────────────────────────────────────────────────────────
+
+function mreqOfferRow(offer) {
+  const qty = offer.offeredQuantity === null || offer.offeredQuantity === undefined ? '—' : offer.offeredQuantity;
+  const respondIn = formatRemaining(offer.respondBy);
+  return `
+    <li class="mreq-offer-item">
+      <div class="mreq-offer-main">
+        <strong>${escapeHtml(offer.pharmacyName || `Pharmacy #${offer.pharmacyId}`)}</strong>
+        <span class="muted font-xs">${escapeHtml(String(offer.distanceKm))} km · zone ${Number(offer.zoneIndex) + 1}</span>
+      </div>
+      <div class="mreq-offer-figures">
+        <span>Offered: <strong>${qty}</strong></span>
+        ${mreqStatusBadge(offer.status)}
+      </div>
+      ${offer.declineReason ? `<p class="muted font-xs">Reason: ${escapeHtml(offer.declineReason)}</p>` : ''}
+      ${offer.status === 'PENDING' && respondIn ? `<p class="muted font-xs">Awaiting response · ${respondIn} left</p>` : ''}
+    </li>`;
+}
+
+async function openMedicineRequestDetail(id) {
+  mreqDetailId = Number(id);
+  const bodyEl = document.querySelector('#mreq-detail-body');
+  const actionsEl = document.querySelector('#mreq-detail-actions');
+  document.querySelector('#mreq-detail-error').textContent = '';
+  bodyEl.innerHTML = '<p class="empty">Loading request…</p>';
+  actionsEl.innerHTML = '<button class="secondary" type="button" data-close="mreq-detail-dialog">Close</button>';
+  openDialog('mreq-detail-dialog');
+
+  try {
+    const res = await api(`${MREQ_API}/${mreqDetailId}`);
+    const r = res.request;
+    const offers = res.offers || [];
+    document.querySelector('#mreq-detail-title').textContent = `${r.medicineName} — request #${r.id}`;
+
+    const accepted = offers.filter(o => o.status === 'ACCEPTED');
+    let emptyNote = '';
+    if (offers.length === 0) emptyNote = '<p class="empty">No offers yet.</p>';
+
+    bodyEl.innerHTML = `
+      <div class="mreq-detail-status">
+        ${mreqStatusBadge(r.status)}
+        ${r.priority === 'URGENT' ? '<span class="badge mreq-badge-urgent">URGENT</span>' : ''}
+        <span class="muted font-xs">${res.viewerRole === 'REQUESTER' ? 'You raised this request' : 'You were asked to help'}</span>
+      </div>
+      ${mreqCoverageBar(r)}
+      ${mreqSearchProgress(r, offers)}
+      <div class="mreq-meta">
+        <span>Created: <strong>${escapeHtml(formatServerTime(r.createdAt))}</strong></span>
+        <span>${formatRemaining(r.expiresAt) ? `Expires in <strong>${formatRemaining(r.expiresAt)}</strong>` : 'Lifetime elapsed'}</span>
+      </div>
+      ${r.reason ? `<p class="muted font-xs">Reason: ${escapeHtml(r.reason)}</p>` : ''}
+      ${r.status === 'FULLY_COVERED'
+        ? '<p class="mreq-notice">This request is fully covered. The committed quantities are awaiting fulfilment — no inventory has moved.</p>'
+        : ''}
+      ${r.status === 'EXPIRED' ? '<p class="mreq-notice">This request has expired and accepts no further offers.</p>' : ''}
+      ${r.status === 'NO_COVERAGE' ? '<p class="mreq-notice">No pharmacy within the maximum radius could supply this medicine.</p>' : ''}
+      ${r.status === 'CANCELLED' ? '<p class="mreq-notice">This request was cancelled.</p>' : ''}
+      <h3 class="mreq-offers-heading">Offers${accepted.length ? ` · ${accepted.length} accepted` : ''}</h3>
+      ${emptyNote || `<ul class="mreq-offer-list">${offers.map(mreqOfferRow).join('')}</ul>`}
+      <p class="muted font-xs">An accepted offer is a commitment to supply. Physical transfer is a separate, future workflow.</p>
+    `;
+
+    const isRequester = res.viewerRole === 'REQUESTER';
+    const canCancel = mreqCanCancel(r.status, isRequester);
+    const canAdvance = isRequester && ['OPEN', 'PARTIALLY_COVERED'].includes(r.status);
+    // Requester actions sit on the left; Close stays on the right. The
+    // "Cancel Request" action is always present in the detail modal for a
+    // cancellable own request — this is the action the manual review found missing.
+    actionsEl.innerHTML = `
+      ${canAdvance ? `<button type="button" class="secondary" data-mreq-advance="${r.id}">Continue search</button>` : ''}
+      ${canCancel ? `<button type="button" class="danger" data-mreq-cancel="${r.id}">Cancel Request</button>` : ''}
+      <button class="secondary" type="button" data-close="mreq-detail-dialog">Close</button>`;
+  } catch (err) {
+    bodyEl.innerHTML = '<p class="empty">This request could not be loaded.</p>';
+    document.querySelector('#mreq-detail-error').textContent = err.message;
+  }
+}
+
+// ── Actions ─────────────────────────────────────────────────────────────────
+
+/** Serializes mutating actions and keeps buttons disabled while in flight. */
+async function mreqRunAction(button, work) {
+  if (mreqBusy) return;
+  if (mreqOffline()) { mreqSetError('This action needs an internet connection.'); return; }
+  mreqBusy = true;
+  const label = button ? button.textContent : null;
+  if (button) { button.disabled = true; button.textContent = 'Working…'; }
+  try {
+    await work();
+  } finally {
+    mreqBusy = false;
+    if (button) { button.disabled = false; if (label !== null) button.textContent = label; }
+  }
+}
+
+async function mreqSubmitOffer(requestId, button) {
+  const input = document.querySelector(`[data-mreq-offer-input="${requestId}"]`);
+  const rowError = document.querySelector(`[data-mreq-row-error="${requestId}"]`);
+  if (rowError) rowError.textContent = '';
+  const max = Number(input && input.max) || 0;
+  const qty = Number(input && input.value);
+
+  // Client-side validation mirrors the server's rules; the server remains authoritative.
+  if (!Number.isInteger(qty) || qty <= 0) {
+    if (rowError) rowError.textContent = 'Enter a whole quantity greater than zero.';
+    return;
+  }
+  if (max > 0 && qty > max) {
+    if (rowError) rowError.textContent = `You can offer at most ${max} units for this request.`;
+    return;
+  }
+
+  await mreqRunAction(button, async () => {
+    try {
+      const res = await api(`${MREQ_API}/${requestId}/offer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ offeredQuantity: qty })
+      });
+      mreqSetError('');
+      const covered = res.coveredQuantity;
+      const remaining = res.remainingQuantity;
+      mreqSetError('');
+      const note = res.idempotentReplay
+        ? 'This offer was already recorded.'
+        : `Offer of ${qty} recorded as a commitment. Covered ${covered}, remaining ${remaining}. No inventory moved.`;
+      if (rowError) { rowError.classList.add('mreq-success-text'); rowError.textContent = note; }
+      await loadMedicineRequestsView();
+    } catch (err) {
+      if (rowError) { rowError.classList.remove('mreq-success-text'); rowError.textContent = err.message; }
+      else mreqSetError(err.message);
+      // A 409 usually means stock or remaining quantity changed — resync.
+      await loadIncomingMedicineRequests();
+    }
+  });
+}
+
+async function mreqSubmitDecline(requestId, button) {
+  const rowError = document.querySelector(`[data-mreq-row-error="${requestId}"]`);
+  if (rowError) rowError.textContent = '';
+  const reason = window.prompt('Optional reason for declining (leave blank to skip):', '');
+  if (reason === null) return;   // user dismissed
+
+  await mreqRunAction(button, async () => {
+    try {
+      await api(`${MREQ_API}/${requestId}/decline`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(reason.trim() ? { reason: reason.trim() } : {})
+      });
+      mreqSetError('');
+      await loadMedicineRequestsView();
+    } catch (err) {
+      if (rowError) rowError.textContent = err.message; else mreqSetError(err.message);
+      await loadIncomingMedicineRequests();
+    }
+  });
+}
+
+async function mreqAdvance(requestId, button) {
+  await mreqRunAction(button, async () => {
+    try {
+      await api(`${MREQ_API}/${requestId}/advance`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      mreqSetError('');
+      if (mreqDetailId === Number(requestId) && document.querySelector('#mreq-detail-dialog').open) {
+        await openMedicineRequestDetail(requestId);
+      }
+      await loadMedicineRequestsView();
+    } catch (err) { mreqSetError(err.message); }
+  });
+}
+
+async function mreqCancel(requestId, button) {
+  // Confirmation is mandatory — a click must never cancel outright.
+  if (!window.confirm('Cancel this medicine request?\n\nAny active search or offer workflow for this request will be cancelled.')) return;
+  await mreqRunAction(button, async () => {
+    try {
+      // The requester pharmacy is derived from the session server-side; no
+      // client pharmacy identity is sent. mreqRunAction blocks duplicate submits.
+      await api(`${MREQ_API}/${requestId}/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      mreqSetError('');
+      // Close the detail modal (matches the existing convention), then refresh
+      // My Requests, Incoming and the incoming badge via loadMedicineRequestsView().
+      const dialog = document.querySelector('#mreq-detail-dialog');
+      if (dialog && dialog.open) closeDialog('mreq-detail-dialog');
+      await loadMedicineRequestsView();
+    } catch (err) {
+      // Never claim success on failure. Show the server's safe message (incl. 409)
+      // and keep the request — and its still-valid Cancel action — visible.
+      mreqSetError(err.message);
+      const detailError = document.querySelector('#mreq-detail-error');
+      if (detailError) detailError.textContent = err.message;
+    }
+  });
+}
+
+// ── Event wiring ────────────────────────────────────────────────────────────
+
+document.querySelectorAll('[data-mreq-tab]').forEach(tab => {
+  tab.addEventListener('click', () => {
+    mreqActiveTab = tab.dataset.mreqTab;
+    document.querySelectorAll('[data-mreq-tab]').forEach(t => {
+      const on = t === tab;
+      t.classList.toggle('active', on);
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+    document.querySelector('#mreq-mine-panel').hidden = mreqActiveTab !== 'mine';
+    document.querySelector('#mreq-incoming-panel').hidden = mreqActiveTab !== 'incoming';
+  });
+});
+
+document.querySelector('#mreq-refresh-btn').addEventListener('click', loadMedicineRequestsView);
+document.querySelector('#mreq-status-filter').addEventListener('change', loadMyMedicineRequests);
+document.querySelector('#mreq-medicine-filter').addEventListener('change', loadMyMedicineRequests);
+
+document.querySelector('#mreq-new-btn').addEventListener('click', () => {
+  document.querySelector('#mreq-create-error').textContent = '';
+  document.querySelector('#mreq-create-form').reset();
+  document.querySelector('#mreq-create-priority').value = 'NORMAL';
+  mreqCreateKey = mreqNewIdempotencyKey();   // one key per dialog session
+  mreqPopulateMedicineOptions();
+  if (mreqOffline()) {
+    document.querySelector('#mreq-create-error').textContent = 'You are offline. Creating a medicine request needs a connection.';
+  }
+  openDialog('mreq-create-dialog');
+});
+
+document.querySelector('#mreq-create-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const errorEl = document.querySelector('#mreq-create-error');
+  const submitBtn = document.querySelector('#mreq-create-submit');
+  errorEl.textContent = '';
+
+  const medicineName = document.querySelector('#mreq-create-medicine').value.trim();
+  const quantity = Number(document.querySelector('#mreq-create-quantity').value);
+  const priority = document.querySelector('#mreq-create-priority').value;
+  const reason = document.querySelector('#mreq-create-reason').value.trim();
+
+  if (!medicineName) { errorEl.textContent = 'Enter the medicine name.'; return; }
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    errorEl.textContent = 'Quantity must be a whole number greater than zero.';
+    return;
+  }
+  if (mreqOffline()) { errorEl.textContent = 'You are offline. Creating a medicine request needs a connection.'; return; }
+  if (!mreqCreateKey) mreqCreateKey = mreqNewIdempotencyKey();
+
+  if (mreqBusy) return;
+  mreqBusy = true;
+  submitBtn.disabled = true;
+  const originalLabel = submitBtn.textContent;
+  submitBtn.textContent = 'Creating…';
+  try {
+    const res = await api(MREQ_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        medicineName,
+        requestedQuantity: quantity,
+        priority,
+        ...(reason ? { reason } : {}),
+        idempotencyKey: mreqCreateKey
+      })
+    });
+    closeDialog('mreq-create-dialog');
+    mreqCreateKey = null;
+    mreqSetError('');
+    mreqActiveTab = 'mine';
+    document.querySelector('[data-mreq-tab="mine"]').click();
+    await loadMedicineRequestsView();
+    // Show the freshly created request with its coverage, zone and status.
+    if (res.request && res.request.id) await openMedicineRequestDetail(res.request.id);
+  } catch (err) {
+    // The key is intentionally retained so a retry is treated as the same request.
+    errorEl.textContent = err.message;
+  } finally {
+    mreqBusy = false;
+    submitBtn.disabled = false;
+    submitBtn.textContent = originalLabel;
+  }
+});
+
+// Delegated actions across both panels and the detail dialog.
+document.addEventListener('click', (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return;
+  const detailId  = target.dataset.mreqDetail;
+  const offerId   = target.dataset.mreqOffer;
+  const declineId = target.dataset.mreqDecline;
+  const advanceId = target.dataset.mreqAdvance;
+  const cancelId  = target.dataset.mreqCancel;
+  if (detailId)  { openMedicineRequestDetail(detailId); return; }
+  if (offerId)   { mreqSubmitOffer(offerId, target); return; }
+  if (declineId) { mreqSubmitDecline(declineId, target); return; }
+  if (advanceId) { mreqAdvance(advanceId, target); return; }
+  if (cancelId)  { mreqCancel(cancelId, target); return; }
+});
+
+window.addEventListener('online',  () => mreqOffline());
+window.addEventListener('offline', () => mreqOffline());

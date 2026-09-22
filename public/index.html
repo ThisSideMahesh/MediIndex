@@ -8,14 +8,20 @@
       <p class="hint">Demo credentials are prefilled for this local development build.</p>
     </section>
     <section id="app-view" hidden>
-      <header><div class="brand-row"><img class="header-logo" src="/assets/mediindex-logo.png" alt="MediIndex"><div><p class="eyebrow">OFFLINE-READY LOCAL SYSTEM</p><h1>MediIndex <span>Dashboard</span></h1></div></div><div class="user"><span id="user-name"></span><button id="logout" class="secondary">Logout</button></div></header>
-      <nav aria-label="Main navigation"><button class="nav active" data-view="dashboard">Dashboard</button><button class="nav" data-view="inventory">Medicines &amp; inventory</button><button class="nav" data-view="billing">Billing &amp; POS</button><button class="nav" data-view="analytics">Demand Forecasting</button><button class="nav" data-view="store-map">Store Layout (2D)</button><button class="nav" data-view="expiry">Expiry alerts</button></nav>
+      <header><div class="brand-row"><img class="header-logo" src="/assets/mediindex-logo.png" alt="MediIndex"><div><p class="eyebrow">OFFLINE-READY LOCAL SYSTEM</p><h1>MediIndex <span>Dashboard</span></h1></div></div><div class="user"><span id="user-name"></span><div id="sync-status" class="sync-status" title="Synchronization status" hidden><span id="sync-icon" class="sync-icon">●</span><span id="sync-label">Online</span><span id="sync-pending" class="sync-pending" hidden></span></div><button id="logout" class="secondary">Logout</button></div></header>
+      <nav aria-label="Main navigation"><button class="nav active" data-view="dashboard">Dashboard</button><button class="nav" data-view="inventory">Medicines &amp; inventory</button><button class="nav" data-view="billing">Billing &amp; POS</button><button class="nav" data-view="analytics">Demand Forecasting</button><button class="nav" data-view="store-map">Store Layout (2D)</button><button class="nav" data-view="expiry">Expiry alerts</button><button class="nav admin-only-nav" data-view="redistribution" hidden>Near-Expiry Redistribution</button><button class="nav admin-only-nav" data-view="mobile-devices" hidden>Mobile Devices</button><button class="nav" data-view="medicine-requests">Medicine Requests<span id="medicine-requests-badge" class="nav-badge" hidden>0</span></button></nav>
       <p class="demo-note">DEMO / SYNTHETIC DATA - values are calculated from the local SQLite database.</p>
       <section id="dashboard-view"><div class="grid" id="metrics"></div><section class="panel"><h2>Foundation status</h2><ul><li><strong>Database:</strong> SQLite is connected and persisted locally.</li><li><strong>Authentication:</strong> password hashes, expiring server sessions and protected API routes are active.</li><li><strong>Inventory &amp; Billing:</strong> catalogue management, multi-batch stock, and transactional FEFO billing are active.</li><li><strong>Forecasting Engine:</strong> 3-period Weighted Moving Average (WMA) with hard reliability guardrails.</li><li><strong>Store Layout:</strong> 2D interactive floor plan visualizer for rapid medicine localization.</li></ul></section></section>
       <section id="inventory-view" hidden>
         <div class="section-heading"><div><p class="eyebrow">CATALOGUE AND BATCH STOCK</p><h2>Medicines &amp; inventory</h2></div><button id="add-medicine">Add medicine</button></div>
         <div class="search-row"><input id="medicine-search" type="search" placeholder="Search medicine or generic name"><button id="inventory-scan-qr-btn" class="secondary" type="button">Scan QR</button><span id="medicine-count" class="muted"></span></div>
         <p id="inventory-error" class="error" role="alert"></p><div id="medicine-list" class="medicine-list"></div>
+        <div id="inactive-medicines-section" hidden>
+          <div class="section-heading" style="margin-top:2rem"><div><p class="eyebrow">ADMIN ONLY</p><h3>Inactive medicines</h3></div></div>
+          <p class="muted" style="margin-bottom:0.75rem">These medicines have been deactivated. Existing batch stock and sales history are preserved. Reactivating restores them to the active catalogue.</p>
+          <div id="inactive-medicine-list" class="medicine-list"></div>
+        </div>
+        <div id="inactive-toggle-row" style="margin-top:1.5rem;display:none"><button id="toggle-inactive-btn" class="secondary">Show inactive medicines</button></div>
       </section>
       <section id="billing-view" hidden>
         <div class="section-heading"><div><p class="eyebrow">POINT OF SALE &amp; DISPENSING</p><h2>Billing &amp; POS</h2></div><button id="pos-scan-qr-btn" class="secondary" type="button">Scan QR to Bill</button></div>
@@ -386,8 +392,165 @@
         <div class="filter-row"><label>Type<select id="alert-status"><option value="ALL">All alerts</option><option value="EXPIRED">Expired</option><option value="EXPIRING_SOON">Expiring within 30 days</option></select></label><label>State<select id="alert-ack"><option value="0">Unacknowledged</option><option value="ALL">All states</option><option value="1">Acknowledged</option></select></label></div>
         <p id="alert-error" class="error" role="alert"></p><div id="alert-list" class="alert-list"></div>
       </section>
+      <section id="redistribution-view" hidden>
+        <div class="section-heading">
+          <div><p class="eyebrow">ADMIN · AUTOMATIC NEAR-EXPIRY REDISTRIBUTION</p><h2>Near-Expiry Redistribution</h2></div>
+          <button id="run-redistribution-btn">Run Near-Expiry Scan</button>
+        </div>
+        <p class="muted" style="margin-bottom:1rem">Automatically detects medicine batches expiring within <strong id="near-expiry-days-label">20</strong> days and creates redistribution requests to nearby pharmacies (within radius) that have a confirmed stock shortage. Proximity requires pharmacy coordinates — see Settings. No inventory is transferred automatically.</p>
+        <div id="redistribution-scan-result" hidden></div>
+        <div class="section-heading" style="margin-top:2rem">
+          <div><p class="eyebrow">REQUEST HISTORY</p><h3>Redistribution Requests</h3></div>
+          <button id="refresh-redistribution-btn" class="secondary">Refresh</button>
+        </div>
+        <div class="filter-row">
+          <label>Role<select id="redistrib-role-filter"><option value="ALL">All (sender &amp; recipient)</option><option value="SENDER">Outgoing (I am sender)</option><option value="RECIPIENT">Incoming (I am recipient)</option></select></label>
+          <label>Status<select id="redistrib-status-filter"><option value="ALL">All statuses</option><option value="PENDING">Pending</option><option value="ACCEPTED">Accepted</option><option value="COMPLETED">Completed</option><option value="CANCELLED">Cancelled</option><option value="REJECTED">Rejected</option></select></label>
+        </div>
+        <p id="redistribution-error" class="error" role="alert"></p>
+        <div class="table-responsive">
+          <table class="pos-table" id="redistribution-table">
+            <thead>
+              <tr><th>ID</th><th>Medicine</th><th>Batch</th><th>Sender</th><th>Recipient</th><th>Qty</th><th>Days Left</th><th>Dist (km)</th><th>Status</th><th>Auto?</th><th>Created</th><th>Action</th></tr>
+            </thead>
+            <tbody id="redistribution-body">
+              <tr><td colspan="12" class="muted text-center">Run a scan or refresh to view requests.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="mobile-devices-view" hidden>
+        <div class="section-heading">
+          <div><p class="eyebrow">ADMIN · MOBILE DEVICE PAIRING</p><h2>Mobile Devices</h2></div>
+          <button id="generate-pairing-code-btn">Generate Pairing Code</button>
+        </div>
+        <p class="muted" style="margin-bottom:1rem">Pair a phone or tablet running the MediIndex Android app with this pharmacy. Generate a one-time code below, then enter it in the app on the device to complete pairing.</p>
+        <p id="pairing-generate-error" class="error" role="alert"></p>
+        <div id="pairing-code-result" hidden>
+          <p class="eyebrow">MOBILE DEVICE PAIRING</p>
+          <p class="muted" style="margin-bottom:0.25rem">Pairing Code</p>
+          <p id="pairing-code-value" style="font-size:2rem;font-weight:800;letter-spacing:0.08em;margin:0 0 0.5rem"></p>
+          <p class="muted">Enter this code in the MediIndex Android app.</p>
+          <p class="hint" id="pairing-code-expiry"></p>
+        </div>
+        <div class="section-heading" style="margin-top:2rem">
+          <div><p class="eyebrow">PAIRED DEVICES</p><h3>Devices</h3></div>
+          <button id="refresh-devices-btn" class="secondary">Refresh</button>
+        </div>
+        <p id="devices-list-error" class="error" role="alert"></p>
+        <div class="table-responsive">
+          <table class="pos-table" id="devices-table">
+            <thead>
+              <tr><th>Device name</th><th>Model</th><th>Created</th><th>Last seen</th><th>Status</th><th>Action</th></tr>
+            </thead>
+            <tbody id="devices-body">
+              <tr><td colspan="6" class="muted text-center">Loading devices…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ── MANUAL MEDICINE REQUESTS (progressive geographic search) ───────
+           A separate workflow from the automatic Near-Expiry Redistribution
+           above. Available to STAFF and ADMIN alike. -->
+      <section id="medicine-requests-view" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">INTER-PHARMACY · MANUAL MEDICINE REQUESTS</p>
+            <h2>Medicine Requests</h2>
+          </div>
+          <div class="mreq-heading-actions">
+            <button id="mreq-refresh-btn" class="secondary">Refresh</button>
+            <button id="mreq-new-btn">New Request</button>
+          </div>
+        </div>
+        <p class="muted" style="margin-bottom:1rem">
+          Request a specific medicine and quantity from nearby pharmacies. The server searches
+          progressively outward, contacting the nearest pharmacies that can help before widening the
+          radius. <strong>Offers are commitments only &mdash; no inventory is transferred.</strong>
+          Proximity requires pharmacy coordinates.
+        </p>
+
+        <div class="mreq-tabs" role="tablist" aria-label="Medicine request views">
+          <button class="mreq-tab active" role="tab" aria-selected="true" data-mreq-tab="mine">My Requests</button>
+          <button class="mreq-tab" role="tab" aria-selected="false" data-mreq-tab="incoming">
+            Incoming Requests<span id="mreq-incoming-count" class="nav-badge" hidden>0</span>
+          </button>
+        </div>
+
+        <p id="mreq-error" class="error" role="alert"></p>
+        <p id="mreq-offline-note" class="hint" hidden>
+          You appear to be offline. Medicine requests need a live connection because stock and
+          proximity are calculated on the server. They are not queued for later sync.
+        </p>
+
+        <!-- My Requests -->
+        <div id="mreq-mine-panel">
+          <div class="filter-row">
+            <label>Status
+              <select id="mreq-status-filter">
+                <option value="ALL">All statuses</option>
+                <option value="OPEN">Open</option>
+                <option value="PARTIALLY_COVERED">Partially covered</option>
+                <option value="FULLY_COVERED">Fully covered</option>
+                <option value="NO_COVERAGE">No coverage</option>
+                <option value="CANCELLED">Cancelled</option>
+                <option value="EXPIRED">Expired</option>
+              </select>
+            </label>
+            <label>Medicine<input id="mreq-medicine-filter" maxlength="150" placeholder="Exact name (optional)"></label>
+          </div>
+          <div id="mreq-mine-list" class="mreq-list" aria-live="polite">
+            <p class="empty">Loading your medicine requests…</p>
+          </div>
+        </div>
+
+        <!-- Incoming Requests -->
+        <div id="mreq-incoming-panel" hidden>
+          <div id="mreq-incoming-list" class="mreq-list" aria-live="polite">
+            <p class="empty">Loading incoming medicine requests…</p>
+          </div>
+        </div>
+      </section>
     </section>
   </main>
+  <dialog id="mreq-create-dialog">
+    <form id="mreq-create-form" method="dialog">
+      <div class="dialog-head"><h2>New medicine request</h2><button class="icon" type="button" data-close="mreq-create-dialog" aria-label="Close">×</button></div>
+      <p class="muted font-xs" style="margin-top:0">Nearby pharmacies will be asked to commit stock. Nothing is transferred automatically.</p>
+      <label>Medicine name
+        <input id="mreq-create-medicine" required maxlength="150" list="mreq-medicine-options" placeholder="Example: Paracetamol">
+      </label>
+      <datalist id="mreq-medicine-options"></datalist>
+      <div class="two-col">
+        <label>Quantity needed<input id="mreq-create-quantity" type="number" min="1" step="1" required placeholder="50"></label>
+        <label>Priority
+          <select id="mreq-create-priority">
+            <option value="NORMAL">Normal</option>
+            <option value="URGENT">Urgent</option>
+          </select>
+        </label>
+      </div>
+      <label>Reason (optional)<input id="mreq-create-reason" maxlength="200" placeholder="Example: Stock shortage"></label>
+      <p class="error" id="mreq-create-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button class="secondary" type="button" data-close="mreq-create-dialog">Cancel</button>
+        <button type="submit" id="mreq-create-submit">Create request</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="mreq-detail-dialog">
+    <div class="dialog-head">
+      <h2 id="mreq-detail-title">Medicine request</h2>
+      <button class="icon" type="button" data-close="mreq-detail-dialog" aria-label="Close">×</button>
+    </div>
+    <div id="mreq-detail-body"></div>
+    <p class="error" id="mreq-detail-error" role="alert"></p>
+    <div class="dialog-actions" id="mreq-detail-actions"></div>
+  </dialog>
+
   <dialog id="medicine-dialog"><form id="medicine-form" method="dialog"><div class="dialog-head"><h2 id="medicine-form-title">Add medicine</h2><button class="icon" type="button" data-close="medicine-dialog" aria-label="Close">×</button></div><input id="medicine-id" type="hidden"><label>Medicine name<input id="medicine-name" required maxlength="150"></label><label>Generic name<input id="medicine-generic" maxlength="150"></label><label>Manufacturer<input id="medicine-manufacturer" maxlength="150"></label><label>Category<input id="medicine-category" maxlength="150"></label><label>Minimum stock<input id="medicine-minimum" type="number" min="0" value="0" required></label><p class="error" id="medicine-form-error" role="alert"></p><div class="dialog-actions"><button class="secondary" type="button" data-close="medicine-dialog">Cancel</button><button type="submit">Save medicine</button></div></form></dialog>
   <dialog id="batch-dialog"><form id="batch-form" method="dialog"><div class="dialog-head"><h2>Add batch stock</h2><button class="icon" type="button" data-close="batch-dialog" aria-label="Close">×</button></div><p id="batch-medicine-label" class="muted"></p><input id="batch-medicine-id" type="hidden"><label>Batch number<input id="batch-number" required maxlength="80"></label><div class="two-col"><label>Quantity<input id="batch-quantity" type="number" min="0" required></label><label>Selling price (INR)<input id="batch-selling" type="number" min="0" step="0.01" required></label></div><div class="two-col"><label>Purchase price (INR)<input id="batch-purchase" type="number" min="0" step="0.01" value="0"></label><label>Expiry date<input id="batch-expiry" type="date" required></label></div><label>Manufacturing date<input id="batch-manufacturing" type="date"></label><label>Shelf/location<input id="batch-location" maxlength="100" placeholder="Example: Rack B, Shelf 2"></label><p class="error" id="batch-form-error" role="alert"></p><div class="dialog-actions"><button class="secondary" type="button" data-close="batch-dialog">Cancel</button><button type="submit">Add batch</button></div></form></dialog>
   <dialog id="receipt-dialog">
@@ -526,6 +689,6 @@
       </div>
     </div>
   </dialog>
-  <script src="/qr-generator.js"></script>
+  <script src="/sync.js"></script>
   <script src="/app.js"></script>
 </body></html>
