@@ -1467,6 +1467,107 @@ async function handler(req, res) {
     } catch (error) { return json(res, 400, { error: error.message }); }
   }
 
+  // ─── POST /api/mobile/qr/lookup ─────────────────────────────────────────
+  // Mobile device-authenticated QR lookup without inventory mutation.
+  // Validates QR payload and returns medicine/batch information for scanning.
+  if (req.method === 'POST' && url.pathname === '/api/mobile/qr/lookup') {
+    const device = await currentDevice(req);
+    if (!device) return json(res, 401, { error: 'Device authentication required. Invalid or revoked device token.' });
+
+    try {
+      const input = await readJson(req);
+      
+      // Parse and validate QR payload using existing validation logic
+      let medicineId, batchNumber;
+      try {
+        const qrPayloadRaw = input.qrPayload || input.payload || input;
+        const parsed = parseAndValidateQrPayload(qrPayloadRaw);
+        medicineId = parsed.medicineId;
+        batchNumber = parsed.batchNumber;
+      } catch (err) {
+        return json(res, 400, { error: 'Invalid QR payload: ' + err.message });
+      }
+
+      // Lookup medicine and batch information without mutation
+      const medicine = await db.prepare(`
+        SELECT id, name, generic_name, manufacturer, category, minimum_stock
+        FROM medicines
+        WHERE id = ? AND pharmacy_id = ? AND active = 1
+      `).get(medicineId, device.pharmacyId);
+
+      if (!medicine) {
+        return json(res, 404, { 
+          valid: false, 
+          authoritative: true,
+          error: `Medicine ID ${medicineId} not found for this pharmacy.` 
+        });
+      }
+
+      const batch = await db.prepare(`
+        SELECT id, batch_number, quantity, purchase_price, selling_price, 
+               manufacturing_date, expiry_date, location
+        FROM medicine_batches
+        WHERE medicine_id = ? AND batch_number = ?
+      `).get(medicine.id, batchNumber);
+
+      if (!batch) {
+        return json(res, 404, { 
+          valid: false, 
+          authoritative: true,
+          medicine: {
+            id: medicine.id,
+            name: medicine.name,
+            genericName: medicine.generic_name,
+            manufacturer: medicine.manufacturer,
+            category: medicine.category,
+            minimumStock: medicine.minimum_stock
+          },
+          error: `Batch '${batchNumber}' not found for medicine '${medicine.name}'.` 
+        });
+      }
+
+      // Calculate expiry status
+      const today = new Date();
+      const expiryDate = new Date(batch.expiry_date);
+      const daysUntilExpiry = Math.floor((expiryDate - today) / (1000 * 60 * 60 * 24));
+      let expiryStatus;
+      if (daysUntilExpiry < 0) {
+        expiryStatus = 'EXPIRED';
+      } else if (daysUntilExpiry <= 30) {
+        expiryStatus = 'NEAR_EXPIRY';
+      } else {
+        expiryStatus = 'VALID';
+      }
+
+      return json(res, 200, {
+        valid: true,
+        authoritative: true,
+        medicine: {
+          id: medicine.id,
+          name: medicine.name,
+          genericName: medicine.generic_name,
+          manufacturer: medicine.manufacturer,
+          category: medicine.category,
+          minimumStock: medicine.minimum_stock
+        },
+        batch: {
+          id: batch.id,
+          batchNumber: batch.batch_number,
+          quantity: batch.quantity,
+          purchasePrice: batch.purchase_price,
+          sellingPrice: batch.selling_price,
+          manufacturingDate: batch.manufacturing_date,
+          expiryDate: batch.expiry_date,
+          expiryStatus: expiryStatus,
+          location: batch.location
+        }
+      });
+
+    } catch (error) {
+      return json(res, 500, { error: 'Internal server error during QR lookup.' });
+    }
+  }
+
   // ─── POST /api/sync/stock-receipt ─────────────────────────────────────────
   // Browser-session-authenticated stock receipt with idempotency.
   // Equivalent to processMobileStockEntry but authenticated via browser session
@@ -1913,7 +2014,7 @@ async function handler(req, res) {
 }
 
 const server = http.createServer((req, res) => handler(req, res).catch(error => { console.error(error); json(res, 500, { error: 'Internal server error.' }); }));
-module.exports = { server, handler, passwordHash, passwordMatches, hashDeviceToken, hashSessionToken, currentDevice, currentUser, db, adapter, SESSION_TTL_MS, processNearExpiryRedistribution, haversineKm, NEAR_EXPIRY_DAYS, NEARBY_RADIUS_KM, medicineRequestEngine, createMedicineRequestEngine, MedicineRequestError };
+module.exports = { server, handler, passwordHash, passwordMatches, hashDeviceToken, hashSessionToken, currentDevice, currentUser, db, adapter, SESSION_TTL_MS, processNearExpiryRedistribution, haversineKm, NEAR_EXPIRY_DAYS, NEARBY_RADIUS_KM, medicineRequestEngine, createMedicineRequestEngine, MedicineRequestError, parseAndValidateQrPayload };
 
 if (require.main === module) {
   server.listen(PORT, () => console.log(`MediIndex API running on http://localhost:${PORT}`));
