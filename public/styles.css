@@ -735,6 +735,12 @@ dialog form {
   background: #fff;
 }
 
+.qr-code-svg svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
 .qr-sticker-meta h3 {
   margin: 0 0 4px 0;
   font-size: 1.05rem;

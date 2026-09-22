@@ -2,6 +2,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const QRCode = require('qrcode');
 const { createDatabaseAdapter } = require('./db/index');
 const { createMedicineRequestEngine, MedicineRequestError } = require('./medicine-requests');
 
@@ -534,7 +535,16 @@ function serveFile(res, requestedPath) {
   const normalized = path.normalize(filePath);
   if (!normalized.startsWith(path.join(__dirname, 'public')) || !fs.existsSync(normalized) || fs.statSync(normalized).isDirectory()) return false;
   const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.png': 'image/png' };
-  res.writeHead(200, { 'Content-Type': types[path.extname(normalized)] || 'application/octet-stream', 'X-Content-Type-Options': 'nosniff' });
+  
+  // Add cache control: no-cache for JS/CSS/HTML to prevent stale code during development
+  const ext = path.extname(normalized);
+  const cacheControl = ['.js', '.css', '.html'].includes(ext) ? 'no-cache, no-store, must-revalidate' : 'public, max-age=3600';
+  
+  res.writeHead(200, { 
+    'Content-Type': types[ext] || 'application/octet-stream', 
+    'X-Content-Type-Options': 'nosniff',
+    'Cache-Control': cacheControl
+  });
   fs.createReadStream(normalized).pipe(res);
   return true;
 }
@@ -896,6 +906,36 @@ async function handler(req, res) {
       return json(res, 200, { status: 'ok', database: 'connected' });
     } catch (err) {
       return json(res, 503, { status: 'error', database: 'unavailable', message: err.message });
+    }
+  }
+
+  // QR Code generation endpoint (no auth required - generates QR for any payload)
+  if (req.method === 'GET' && url.pathname === '/api/qr/generate') {
+    const payload = url.searchParams.get('payload');
+    if (!payload) {
+      return json(res, 400, { error: 'Missing required parameter: payload' });
+    }
+
+    try {
+      // Generate QR code as SVG using proven qrcode library
+      const svg = await QRCode.toString(payload, {
+        type: 'svg',
+        errorCorrectionLevel: 'M',
+        margin: 4,
+        width: 256,
+        color: {
+          dark: '#102a43',
+          light: '#ffffff'
+        }
+      });
+      
+      res.setHeader('Content-Type', 'image/svg+xml');
+      res.setHeader('Cache-Control', 'public, max-age=3600'); // Cache for 1 hour
+      res.writeHead(200);
+      return res.end(svg);
+    } catch (err) {
+      console.error('QR generation error:', err);
+      return json(res, 500, { error: 'QR code generation failed', message: err.message });
     }
   }
 

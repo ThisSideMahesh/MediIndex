@@ -776,7 +776,20 @@ async function openQrSticker(batchId) {
     document.querySelector('#qr-sticker-raw-payload').textContent = res.payloadString;
 
     const svgWrapper = document.querySelector('#qr-sticker-svg-wrapper');
-    svgWrapper.innerHTML = window.QRCodeGenerator ? window.QRCodeGenerator.generateSVG(res.payloadString, 4) : '<span>QR Generator Ready</span>';
+    
+    // Fetch QR from server endpoint (proven qrcode library)
+    try {
+      const qrResponse = await fetch(`/api/qr/generate?payload=${encodeURIComponent(res.payloadString)}`);
+      
+      if (!qrResponse.ok) {
+        throw new Error(`QR generation failed: ${qrResponse.status}`);
+      }
+      const svg = await qrResponse.text();
+      svgWrapper.innerHTML = svg;
+    } catch (qrErr) {
+      console.error('QR generation error:', qrErr);
+      svgWrapper.innerHTML = '<div style="color: #d32f2f; padding: 1rem;">QR generation failed. Please try again.</div>';
+    }
 
     openDialog('qr-sticker-dialog');
   } catch (err) {
