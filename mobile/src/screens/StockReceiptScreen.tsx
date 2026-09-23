@@ -5,6 +5,17 @@
  * medicine/batch context, accepts quantity input, and either:
  * - Submits online stock receipt to backend API (Phase 7G - when connected)
  * - Queues operation in SQLite outbox (Phase 7H - when offline)
+ *
+ * MANUAL ENTRY (bug fix): when this screen is reached WITHOUT route params
+ * (the Home screen's "Stock Receipt — Manual entry" action, which has no
+ * scanned target to pass), it shows a small form asking the user to type
+ * the medicine ID and batch number themselves. Submitting that form calls
+ * the EXACT SAME `lookupQrCode()` the QR-scan path already uses to fetch
+ * authoritative medicine/batch context — there is no separate manual
+ * validation path and no duplicated stock-mutation logic. Once the lookup
+ * succeeds, the rest of this screen (quantity entry, submit, offline queue,
+ * error handling) behaves identically regardless of how medicineId/
+ * batchNumber were obtained.
  */
 
 import React, { useState, useEffect } from 'react';
@@ -32,12 +43,35 @@ import { isOnline } from '../utils/connectivity';
 import { outbox } from '../storage/outbox';
 import type { StockReceiptState, StockReceiptContext } from '../types/stockReceipt';
 import type { QrLookupResponse, MediIndexQrPayload } from '../types/api';
-import { ApiError, classifyError, toUserMessage } from '../api/errors';
+import { ApiError, classifyError, toStockReceiptUserMessage } from '../api/errors';
+import { validateManualStockEntry } from '../utils/stockReceiptValidation';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'StockReceipt'>;
 
 export function StockReceiptScreen({ route, navigation }: Props) {
-  const { medicineId, batchNumber } = route.params || { medicineId: 0, batchNumber: '' };
+  // Manual entry (Home screen's "Manual entry" action) reaches this screen
+  // with route.params === undefined — there is no scanned target yet. The QR
+  // flow (ScanQrScreen) always supplies real, server-validated params. This
+  // screen tracks medicineId/batchNumber as STATE (not a fixed destructure)
+  // so the manual-entry form below can set them once the user has typed
+  // both fields, at which point the identical lookup/submit flow used by the
+  // QR path takes over.
+  const initialParams = route.params;
+  const [medicineId, setMedicineId] = useState<number>(initialParams?.medicineId ?? 0);
+  const [batchNumber, setBatchNumber] = useState<string>(initialParams?.batchNumber ?? '');
+
+  // True once we have a medicineId/batchNumber pair worth looking up — either
+  // because the QR flow supplied them, or because the manual-entry form was
+  // submitted. False means: show the manual-entry input form instead of the
+  // loading/lookup UI.
+  const [hasTarget, setHasTarget] = useState<boolean>(Boolean(initialParams));
+
+  // Manual-entry form's own input state and validation, kept separate from
+  // the quantity form below so a bad medicine-ID/batch-number entry doesn't
+  // touch quantity state at all.
+  const [manualMedicineIdText, setManualMedicineIdText] = useState('');
+  const [manualBatchNumberText, setManualBatchNumberText] = useState('');
+  const [manualEntryError, setManualEntryError] = useState<string | null>(null);
 
   const [context, setContext] = useState<StockReceiptContext>({
     state: 'IDLE',
@@ -54,23 +88,57 @@ export function StockReceiptScreen({ route, navigation }: Props) {
 
   const [quantityText, setQuantityText] = useState('1');
   const [lookupResult, setLookupResult] = useState<QrLookupResponse | null>(null);
-  const [isLoadingContext, setIsLoadingContext] = useState(true);
+  const [isLoadingContext, setIsLoadingContext] = useState(Boolean(initialParams));
 
-  // Load authoritative medicine/batch context on mount
+  // Load authoritative medicine/batch context on mount — but ONLY when we
+  // actually have a target (QR flow). Manual entry has nothing to look up
+  // yet and must show the input form first; loadMedicineContext() runs later
+  // when handleManualEntrySubmit() sets hasTarget to true.
   useEffect(() => {
-    loadMedicineContext();
+    if (hasTarget) {
+      loadMedicineContext();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const loadMedicineContext = async () => {
+  const handleManualEntrySubmit = () => {
+    const validation = validateManualStockEntry({
+      medicineIdText: manualMedicineIdText,
+      batchNumberText: manualBatchNumberText,
+    });
+    if (!validation.valid) {
+      setManualEntryError(validation.error);
+      return;
+    }
+    setManualEntryError(null);
+
+    const { medicineId: parsedId, batchNumber: trimmedBatch } = validation;
+
+    setMedicineId(parsedId);
+    setBatchNumber(trimmedBatch);
+    setContext(prev => ({ ...prev, medicineId: parsedId, batchNumber: trimmedBatch }));
+    setHasTarget(true);
+    setIsLoadingContext(true);
+    // loadMedicineContext reads medicineId/batchNumber from component scope;
+    // call it directly with the freshly-parsed values so it does not race the
+    // setState above (React state updates are not synchronous).
+    void loadMedicineContext(parsedId, trimmedBatch);
+  };
+
+  const loadMedicineContext = async (overrideMedicineId?: number, overrideBatchNumber?: string) => {
+    const lookupMedicineId = overrideMedicineId ?? medicineId;
+    const lookupBatchNumber = overrideBatchNumber ?? batchNumber;
     try {
       setIsLoadingContext(true);
       
-      // Use existing QR lookup to get authoritative context
+      // Use existing QR lookup to get authoritative context — the SAME
+      // function and endpoint the QR-scan flow uses. Manual entry is not a
+      // separate validation path; it feeds this identical lookup.
       const result = await lookupQrCode({
         app: 'MEDIINDEX',
         v: 1,
-        medicineId,
-        batchNumber,
+        medicineId: lookupMedicineId,
+        batchNumber: lookupBatchNumber,
       } as MediIndexQrPayload);
 
       setLookupResult(result);
@@ -97,9 +165,16 @@ export function StockReceiptScreen({ route, navigation }: Props) {
       }
     } catch (err) {
       logger.error('stock-receipt', 'Failed to load medicine context', { error: err });
+      // A "medicine/batch not found" lookup failure arrives here as a thrown
+      // ApiError (the endpoint returns a non-2xx status), not as a resolved
+      // { valid: false } result — see core.js's /api/mobile/qr/lookup, which
+      // returns 404 for both cases. Surface that specific, already-safe
+      // message (same reviewed allow-list used for stock-entry submission)
+      // instead of a generic message, since for manual entry this is the
+      // most common failure (a typo'd medicine ID or batch number).
       setContext(prev => ({
         ...prev,
-        error: 'Could not load medicine information. Please try again.',
+        error: toStockReceiptUserMessage(err),
       }));
     } finally {
       setIsLoadingContext(false);
@@ -310,7 +385,7 @@ export function StockReceiptScreen({ route, navigation }: Props) {
     setContext(prev => ({
       ...prev,
       state: 'ERROR',
-      error: toUserMessage(err, category),
+      error: toStockReceiptUserMessage(err, category),
     }));
   };
 
@@ -349,6 +424,74 @@ export function StockReceiptScreen({ route, navigation }: Props) {
     setQuantityText('1');
   };
 
+  // MANUAL ENTRY FORM — shown only when this screen was reached without a
+  // scanned target (Home screen's "Manual entry" action). Once submitted and
+  // validated, hasTarget becomes true and the screen falls through to the
+  // exact same loading/lookup/quantity/submit UI the QR flow already uses.
+  if (!hasTarget) {
+    return (
+      <KeyboardAvoidingView
+        style={styles.container}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      >
+        <ScrollView style={styles.scrollContainer} showsVerticalScrollIndicator={false}>
+          <View style={styles.quantitySection}>
+            <Text style={styles.sectionTitle}>Enter Medicine &amp; Batch</Text>
+            <Text style={styles.inputLabel}>Medicine ID:</Text>
+            <TextInput
+              style={styles.quantityInput}
+              value={manualMedicineIdText}
+              onChangeText={text => {
+                setManualMedicineIdText(text);
+                if (manualEntryError) setManualEntryError(null);
+              }}
+              keyboardType="numeric"
+              placeholder="e.g. 12"
+              accessibilityLabel="Medicine ID"
+            />
+            <Text style={[styles.inputLabel, { marginTop: theme.spacing.md }]}>Batch Number:</Text>
+            <TextInput
+              style={styles.quantityInput}
+              value={manualBatchNumberText}
+              onChangeText={text => {
+                setManualBatchNumberText(text);
+                if (manualEntryError) setManualEntryError(null);
+              }}
+              autoCapitalize="characters"
+              placeholder="e.g. PAR-A-2601"
+              accessibilityLabel="Batch number"
+            />
+          </View>
+
+          {manualEntryError && (
+            <View style={styles.errorContainer}>
+              <Text style={styles.errorText}>{manualEntryError}</Text>
+            </View>
+          )}
+        </ScrollView>
+
+        <View style={styles.actionContainer}>
+          <View style={styles.buttonRow}>
+            <TouchableOpacity
+              style={[styles.button, styles.secondaryButton]}
+              onPress={() => navigation.goBack()}
+            >
+              <Text style={styles.secondaryButtonText}>Cancel</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.button, styles.primaryButton]}
+              onPress={handleManualEntrySubmit}
+              accessibilityRole="button"
+              accessibilityLabel="Look up medicine and batch"
+            >
+              <Text style={styles.buttonText}>Look Up</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+    );
+  }
+
   if (isLoadingContext) {
     return (
       <View style={styles.centerContainer}>
@@ -364,9 +507,18 @@ export function StockReceiptScreen({ route, navigation }: Props) {
         <Text style={styles.errorText}>{context.error}</Text>
         <TouchableOpacity
           style={styles.retryButton}
-          onPress={loadMedicineContext}
+          onPress={() => loadMedicineContext()}
         >
           <Text style={styles.buttonText}>Retry</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.retryButton, styles.secondaryButton, { marginTop: theme.spacing.md }]}
+          onPress={() => {
+            setHasTarget(false);
+            setContext(prev => ({ ...prev, error: null }));
+          }}
+        >
+          <Text style={styles.secondaryButtonText}>Enter Different Medicine/Batch</Text>
         </TouchableOpacity>
       </View>
     );

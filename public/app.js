@@ -193,6 +193,32 @@ async function showApp(user) {
   }
 }
 
+/**
+ * Re-fetches and re-renders the views whose data a stock-quantity mutation
+ * (batch receipt, sale, adjustment) can affect, so the currently-open UI
+ * reflects the authoritative server state without requiring a manual
+ * browser refresh.
+ *
+ * Always refreshes the Dashboard and Inventory list — both are cheap,
+ * targeted GETs and are the two views users check immediately after any
+ * stock change. Store Map and Expiry Alerts are only re-fetched when they
+ * are the CURRENTLY VISIBLE view, to avoid unnecessary requests for views
+ * the user isn't looking at (they still self-refresh via switchView() the
+ * next time the user navigates to them).
+ *
+ * This intentionally re-fetches from the server rather than incrementing
+ * local counters — the UI must stay consistent with authoritative backend
+ * state, not a client-side guess.
+ */
+async function refreshInventoryRelatedViews() {
+  await Promise.all([
+    loadMedicines(),
+    refreshDashboard(),
+    document.querySelector('#store-map-view').hidden ? null : loadStoreMapView(),
+    document.querySelector('#expiry-view').hidden ? null : loadAlerts(),
+  ]);
+}
+
 function switchView(view) {
   document.querySelectorAll('.nav').forEach(button => button.classList.toggle('active', button.dataset.view === view));
   document.querySelector('#dashboard-view').hidden = view !== 'dashboard';
@@ -534,8 +560,10 @@ async function handleCheckout(event) {
     renderReceipt(result.sale);
     openDialog('receipt-dialog');
 
-    // Refresh Background Data
-    await refreshDashboard();
+    // Refresh Background Data — a sale reduces batch quantities, so the
+    // inventory list, dashboard metrics, and (if open) store map/expiry
+    // views must reflect the new authoritative stock levels immediately.
+    await refreshInventoryRelatedViews();
     await loadSalesHistory();
   } catch (err) {
     errorEl.textContent = err.message;
@@ -1323,8 +1351,7 @@ document.querySelector('#batch-form').addEventListener('submit', async event => 
       body: JSON.stringify(body)
     });
     closeDialog('batch-dialog');
-    await loadMedicines();
-    await refreshDashboard();
+    await refreshInventoryRelatedViews();
   } catch (error) {
     errorEl.textContent = error.message;
   }

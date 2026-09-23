@@ -149,3 +149,56 @@ export function toUserMessage(error: unknown, category: ErrorCategory = classify
       return 'An unexpected error occurred.';
   }
 }
+
+/**
+ * A small, explicit allow-list of PERMANENT-category error messages that
+ * `POST /api/mobile/stock-entry` (core.js's processMobileStockEntry) is known
+ * to return verbatim in its `{ error: string }` body. That endpoint does not
+ * send a machine-readable `code` field, so `ApiError.code` is always
+ * undefined for it — `toUserMessage()` therefore falls through to one generic
+ * sentence for every permanent failure, discarding backend text like
+ * "Active medicine ID 12 not found for this pharmacy." that is already safe
+ * to show (no SQL, no stack trace, no secret) and far more actionable than
+ * the generic fallback.
+ *
+ * This is intentionally a PATTERN allow-list, not a blanket "trust
+ * error.message" rule: only messages matching these known, hand-reviewed
+ * shapes are surfaced verbatim. Anything else (a raw 500, a message we don't
+ * recognise) still falls back to the safe generic text from `toUserMessage`,
+ * so a future backend change that starts leaking internal detail cannot
+ * reach the UI just because it also returns a PERMANENT-classified status.
+ */
+const STOCK_RECEIPT_SAFE_MESSAGE_PATTERNS: ReadonlyArray<RegExp> = [
+  // "Active medicine ID 12 not found for this pharmacy." (processMobileStockEntry)
+  // "Medicine ID 12 not found for this pharmacy." (POST /api/mobile/qr/lookup)
+  /^(?:Active )?[Mm]edicine ID \d+ not found for this pharmacy\.$/,
+  /^Batch '.*' not found for medicine '.*'\.$/,
+  /^Quantity must be a positive whole number greater than zero\.$/,
+  /^Quantity exceeds maximum allowable limit of [\d,]+ units per intake transaction\.$/,
+  /^Quantity is required\.$/,
+  /^Device has been revoked or is no longer authorized\.$/,
+  /^Device authentication required\. Invalid or revoked device token\.$/,
+  /^Idempotency key conflict: This idempotency key was previously used with a different request payload\.$/,
+  /^Invalid QR payload: .*$/,
+  /^Invalid medicine ID in QR payload\.$/,
+  /^Unrecognized application tag\. Expected MEDIINDEX\.$/,
+  /^Unsupported QR version: .*$/,
+];
+
+/**
+ * Stock-receipt-specific message mapper. Behaves exactly like
+ * `toUserMessage()` for AUTHENTICATION/RETRYABLE/UNKNOWN, but for PERMANENT
+ * failures returns the backend's own message when (and only when) it matches
+ * the reviewed allow-list above — e.g. "Medicine not found", "Batch not
+ * found", "Invalid quantity" — instead of a single generic sentence. Falls
+ * back to `toUserMessage()`'s generic text for anything unrecognised.
+ */
+export function toStockReceiptUserMessage(error: unknown, category: ErrorCategory = classifyError(error)): string {
+  if (category === 'PERMANENT' && error instanceof ApiError && typeof error.message === 'string') {
+    const trimmed = error.message.trim();
+    if (STOCK_RECEIPT_SAFE_MESSAGE_PATTERNS.some(pattern => pattern.test(trimmed))) {
+      return trimmed;
+    }
+  }
+  return toUserMessage(error, category);
+}
