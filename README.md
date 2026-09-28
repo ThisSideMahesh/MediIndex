@@ -58,8 +58,8 @@ For local evaluation and viva demonstration, deterministic demo accounts are pre
 
 | Role | Email Address | Password | Permissions |
 |---|---|---|---|
-| **Administrator** | `admin@mediindex.local` | `MediIndex@2026` | Full access: master catalogue CRUD, batch stock, POS billing, expiry alerts, adjustments |
-| **Pharmacy Staff** | `staff@mediindex.local` | `MediIndex@2026` | Operational access: batch stock receipt, POS billing, expiry inspection, search |
+| **Administrator** | `admin.a@mediindex.com` & 'admin.b@mediindex.com' | `Demo@12345` | Full access: master catalogue CRUD, batch stock, POS billing, expiry alerts, adjustments |
+| **Pharmacy Staff** | `staff.a@mediindex.com` | `Demo@12345` | Operational access: batch stock receipt, POS billing, expiry inspection, search |
 
 ---
 
