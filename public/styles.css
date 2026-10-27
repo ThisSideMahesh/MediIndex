@@ -1729,6 +1729,7 @@ dialog form {
   border: 1px solid var(--line);
   border-radius: 4px;
   background: white;
+  color: var(--ink);       /* override base button { color: white } — was root cause of invisible text */
   cursor: pointer;
   font-size: 0.9rem;
   text-align: left;
@@ -1738,6 +1739,7 @@ dialog form {
 .relocate-shelf-btn:hover {
   background: var(--accent-light);
   border-color: var(--accent);
+  color: var(--ink);       /* keep text dark against --accent-light teal tint */
 }
 
 .relocate-shelf-btn.selected {
