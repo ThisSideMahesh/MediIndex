@@ -373,13 +373,13 @@ async function calculateDemandForecast(pharmacyId) {
     const requiredPeriods = 3;
 
     if (periodsCount < requiredPeriods) {
-      const reorderNeeded = Math.max(0, med.minimum_stock - med.current_stock);
+      const reorderNeeded = Math.max(0, med.minimum_stock - Number(med.current_stock));
       return {
         medicineId: med.id,
         medicineName: med.name,
         genericName: med.generic_name,
         category: med.category,
-        currentStock: med.current_stock,
+        currentStock: Number(med.current_stock),
         minimumStock: med.minimum_stock,
         totalSold: med.total_historical_sold,
         status: 'INSUFFICIENT_DATA',
@@ -391,13 +391,50 @@ async function calculateDemandForecast(pharmacyId) {
         forecast: null,
         safetyStock: med.minimum_stock,
         recommendedReorder: reorderNeeded,
-        riskLevel: med.current_stock <= med.minimum_stock ? (med.current_stock === 0 ? 'OUT_OF_STOCK' : 'LOW_STOCK') : 'MONITORING'
+        riskLevel: Number(med.current_stock) <= med.minimum_stock ? (Number(med.current_stock) === 0 ? 'OUT_OF_STOCK' : 'LOW_STOCK') : 'MONITORING'
       };
     }
 
-    const p1 = periods[0].quantity_sold;
-    const p2 = periods[1].quantity_sold;
-    const p3 = periods[2].quantity_sold;
+    // Number() coercion is required here: PostgreSQL returns SUM(INTEGER) as a
+    // bigint, which the pg driver hands to JavaScript as a string (e.g. '30').
+    // JavaScript's + operator is overloaded — when either operand is a string it
+    // concatenates rather than adds, so (p1 + p2 + p3) / 3 would compute
+    // ('30' + '20' + '10') / 3 = 100670 instead of 20, corrupting mean, variance,
+    // stdDev, safetyStock, and the reorder recommendation. The WMA line is
+    // unaffected by this bug because * always coerces to number, but we normalise
+    // all three quantities consistently here to keep the calculation safe against
+    // the adapter's return type and any future query changes.
+    // On SQLite, Number(30) === 30, so this is a no-op for local development.
+    const p1 = Number(periods[0].quantity_sold);
+    const p2 = Number(periods[1].quantity_sold);
+    const p3 = Number(periods[2].quantity_sold);
+
+    // Guard: if any period produced a non-finite value (should not occur given the
+    // SQL SUM + WHERE filter, but defensive against future schema changes or
+    // corrupted rows), fall back to INSUFFICIENT_DATA rather than propagating
+    // NaN or Infinity through the forecast.
+    if (!Number.isFinite(p1) || !Number.isFinite(p2) || !Number.isFinite(p3)) {
+      const reorderNeeded = Math.max(0, med.minimum_stock - Number(med.current_stock));
+      return {
+        medicineId: med.id,
+        medicineName: med.name,
+        genericName: med.generic_name,
+        category: med.category,
+        currentStock: Number(med.current_stock),
+        minimumStock: med.minimum_stock,
+        totalSold: med.total_historical_sold,
+        status: 'INSUFFICIENT_DATA',
+        message: 'INSUFFICIENT DATA FOR RELIABLE FORECAST',
+        periodsFound: periodsCount,
+        periodsRequired: requiredPeriods,
+        historicalPeriods: periods,
+        methodology: 'Weighted Moving Average (WMA) requires at least 3 historical sales periods',
+        forecast: null,
+        safetyStock: med.minimum_stock,
+        recommendedReorder: reorderNeeded,
+        riskLevel: Number(med.current_stock) <= med.minimum_stock ? (Number(med.current_stock) === 0 ? 'OUT_OF_STOCK' : 'LOW_STOCK') : 'MONITORING'
+      };
+    }
 
     const w1 = 0.50, w2 = 0.30, w3 = 0.20;
     const weeklyForecast = (w1 * p1) + (w2 * p2) + (w3 * p3);
@@ -410,15 +447,22 @@ async function calculateDemandForecast(pharmacyId) {
     const calculatedSafetyStock = Math.round(1.65 * stdDev);
     const safetyStock = Math.max(med.minimum_stock, calculatedSafetyStock);
 
+    // Number() coercion on current_stock: COALESCE(SUM(b.quantity), 0) returns
+    // bigint on PostgreSQL, which the pg driver also delivers as a string.
+    // Arithmetic operators coerce automatically, but explicit normalisation here
+    // keeps the calculation safe and ensures currentStock in the API response is
+    // always a number, not a string.
+    const currentStock = Number(med.current_stock);
+
     const targetInventory = monthlyForecast + safetyStock;
-    const recommendedReorder = Math.max(0, targetInventory - med.current_stock);
+    const recommendedReorder = Math.max(0, targetInventory - currentStock);
 
     let riskLevel = 'OPTIMAL_STOCK';
-    if (med.current_stock <= 0) {
+    if (currentStock <= 0) {
       riskLevel = 'OUT_OF_STOCK';
-    } else if (med.current_stock < safetyStock) {
+    } else if (currentStock < safetyStock) {
       riskLevel = 'HIGH_RUNOUT_RISK';
-    } else if (med.current_stock < targetInventory) {
+    } else if (currentStock < targetInventory) {
       riskLevel = 'REORDER_NEEDED';
     }
 
@@ -427,7 +471,7 @@ async function calculateDemandForecast(pharmacyId) {
       medicineName: med.name,
       genericName: med.generic_name,
       category: med.category,
-      currentStock: med.current_stock,
+      currentStock,
       minimumStock: med.minimum_stock,
       totalSold: med.total_historical_sold,
       status: 'RELIABLE',
