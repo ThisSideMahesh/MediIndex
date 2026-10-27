@@ -553,6 +553,37 @@
 
   <dialog id="medicine-dialog"><form id="medicine-form" method="dialog"><div class="dialog-head"><h2 id="medicine-form-title">Add medicine</h2><button class="icon" type="button" data-close="medicine-dialog" aria-label="Close">×</button></div><input id="medicine-id" type="hidden"><label>Medicine name<input id="medicine-name" required maxlength="150"></label><label>Generic name<input id="medicine-generic" maxlength="150"></label><label>Manufacturer<input id="medicine-manufacturer" maxlength="150"></label><label>Category<input id="medicine-category" maxlength="150"></label><label>Minimum stock<input id="medicine-minimum" type="number" min="0" value="0" required></label><p class="error" id="medicine-form-error" role="alert"></p><div class="dialog-actions"><button class="secondary" type="button" data-close="medicine-dialog">Cancel</button><button type="submit">Save medicine</button></div></form></dialog>
   <dialog id="batch-dialog"><form id="batch-form" method="dialog"><div class="dialog-head"><h2>Add batch stock</h2><button class="icon" type="button" data-close="batch-dialog" aria-label="Close">×</button></div><p id="batch-medicine-label" class="muted"></p><input id="batch-medicine-id" type="hidden"><label>Batch number<input id="batch-number" required maxlength="80"></label><div class="two-col"><label>Quantity<input id="batch-quantity" type="number" min="0" required></label><label>Selling price (INR)<input id="batch-selling" type="number" min="0" step="0.01" required></label></div><div class="two-col"><label>Purchase price (INR)<input id="batch-purchase" type="number" min="0" step="0.01" value="0"></label><label>Expiry date<input id="batch-expiry" type="date" required></label></div><label>Manufacturing date<input id="batch-manufacturing" type="date"></label><label>Shelf/location<input id="batch-location" maxlength="100" placeholder="Example: Rack B, Shelf 2"></label><p class="error" id="batch-form-error" role="alert"></p><div class="dialog-actions"><button class="secondary" type="button" data-close="batch-dialog">Cancel</button><button type="submit">Add batch</button></div></form></dialog>
+  <dialog id="relocate-batch-dialog">
+    <div class="dialog-head">
+      <h2>Relocate batch to new shelf</h2>
+      <button class="icon" type="button" data-close="relocate-batch-dialog" aria-label="Close">×</button>
+    </div>
+    <div class="relocate-batch-content">
+      <p class="muted">Medicine: <strong id="relocate-medicine-name"></strong></p>
+      <p class="muted">Batch: <strong id="relocate-batch-number"></strong></p>
+      <div class="relocate-location-row">
+        <div>
+          <p class="eyebrow">CURRENT LOCATION</p>
+          <p id="relocate-current-location" class="relocate-location-value">Rack B / Shelf B1</p>
+        </div>
+        <div>
+          <p class="eyebrow">NEW LOCATION</p>
+          <p id="relocate-new-location" class="relocate-location-value muted">Click a shelf on the map below</p>
+        </div>
+      </div>
+      <div class="relocate-map-hint">
+        <p class="hint">Select the destination shelf from the store map. The selected shelf will be highlighted.</p>
+      </div>
+      <div class="relocate-map-container">
+        <div class="floor-plan-grid-compact" id="relocate-map-grid"></div>
+      </div>
+      <p class="error" id="relocate-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button class="secondary" type="button" data-close="relocate-batch-dialog">Cancel</button>
+        <button type="button" id="relocate-save-btn" disabled>Save Location</button>
+      </div>
+    </div>
+  </dialog>
   <dialog id="receipt-dialog">
     <div class="receipt-card">
       <div class="receipt-header">

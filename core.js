@@ -927,6 +927,27 @@ async function processNearExpiryRedistribution(pharmacyId, opts = {}) {
   return { created, skippedDuplicate, skippedNoCoordinates, skippedSufficientStock, requests };
 }
 
+// Authoritative shelf/rack layout for this pharmacy floor plan.
+// This is the single source of truth used by GET /api/layout/shelves and
+// validated against by PUT /api/batches/:id/location.
+const STANDARD_SHELVES = [
+  { id: 'Rack A1', rack: 'RACK_A', label: 'A1 - Fast Moving Analgesics', zone: 'Front Left', description: 'Paracetamol, Ibuprofen, Aspirin' },
+  { id: 'Rack A2', rack: 'RACK_A', label: 'A2 - Pain & Anti-inflammatory', zone: 'Front Left', description: 'Diclofenac, Aceclofenac' },
+  { id: 'Rack A3', rack: 'RACK_A', label: 'A3 - Antipyretics & Cold', zone: 'Front Left', description: 'Cetirizine, Cough Syrups' },
+  { id: 'Rack B1', rack: 'RACK_B', label: 'B1 - Broad Spectrum Antibiotics', zone: 'Front Right', description: 'Amoxicillin, Azithromycin' },
+  { id: 'Rack B2', rack: 'RACK_B', label: 'B2 - Cephalosporins & Fluoroquinolones', zone: 'Front Right', description: 'Cefixime, Ciprofloxacin' },
+  { id: 'Rack B3', rack: 'RACK_B', label: 'B3 - Antifungals & Antivirals', zone: 'Front Right', description: 'Fluconazole, Acyclovir' },
+  { id: 'Rack C1', rack: 'RACK_C', label: 'C1 - Cardiovascular & Hypertension', zone: 'Rear Left', description: 'Amlodipine, Telmisartan, Atenolol' },
+  { id: 'Rack C2', rack: 'RACK_C', label: 'C2 - Diabetes & Endocrine', zone: 'Rear Left', description: 'Metformin, Glimepiride' },
+  { id: 'Rack C3', rack: 'RACK_C', label: 'C3 - Gastrointestinal & Antacids', zone: 'Rear Left', description: 'Pantoprazole, Omeprazole, Domperidone' },
+  { id: 'Rack D1', rack: 'RACK_D', label: 'D1 - Dermatological Topicals & Ointments', zone: 'Rear Right', description: 'Betamethasone, Clotrimazole Cream' },
+  { id: 'Rack D2', rack: 'RACK_D', label: 'D2 - Ophthalmic & Otic Drops', zone: 'Rear Right', description: 'Ciprofloxacin Eye Drops, Tears' },
+  { id: 'Rack D3', rack: 'RACK_D', label: 'D3 - Respiratory & Inhalers', zone: 'Rear Right', description: 'Salbutamol, Budesonide Inhalers' },
+  { id: 'Cold Storage F1', rack: 'RACK_COLD', label: 'Cold Bay F1 - Insulins & Biologics (2-8°C)', zone: 'Cold Refrigerator', description: 'Human Insulin, Glargine' },
+  { id: 'Cold Storage F2', rack: 'RACK_COLD', label: 'Cold Bay F2 - Vaccines & Sera (2-8°C)', zone: 'Cold Refrigerator', description: 'Tetanus Toxoid, Rabies Vaccines' }
+];
+const VALID_SHELF_IDS = new Set(STANDARD_SHELVES.map(s => s.id.toLowerCase()));
+
 async function handler(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
@@ -1160,6 +1181,24 @@ async function handler(req, res) {
     } catch (error) { return json(res, 400, { error: error.message }); }
   }
 
+  const batchLocationMatch = url.pathname.match(/^\/api\/batches\/(\d+)\/location$/);
+  if (batchLocationMatch && req.method === 'PUT') {
+    if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
+    try {
+      const input = await readJson(req);
+      const newLocation = cleanText(input.location, 'Location', { max: 100 });
+      // Non-empty locations must match a shelf in the store layout exactly (case-insensitive).
+      // Empty string is allowed — it clears the shelf assignment.
+      if (newLocation && !VALID_SHELF_IDS.has(newLocation.toLowerCase())) {
+        return json(res, 422, { error: `Invalid destination: "${newLocation}" is not a shelf in this store layout.` });
+      }
+      const batch = await db.prepare('SELECT b.* FROM medicine_batches b JOIN medicines m ON m.id=b.medicine_id WHERE b.id=? AND m.pharmacy_id=? AND m.active=1').get(Number(batchLocationMatch[1]), user.pharmacy_id);
+      if (!batch) return json(res, 404, { error: 'Batch not found.' });
+      await db.prepare('UPDATE medicine_batches SET location = ? WHERE id = ?').run(newLocation, batch.id);
+      return json(res, 200, { batch: await db.prepare('SELECT * FROM medicine_batches WHERE id=?').get(batch.id) });
+    } catch (error) { return json(res, 400, { error: error.message }); }
+  }
+
   const batchQrMatch = url.pathname.match(/^\/api\/batches\/(\d+)\/qr$/);
   if (batchQrMatch && req.method === 'GET') {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
@@ -1211,22 +1250,7 @@ async function handler(req, res) {
     if (!requireRole(res, user, 'ADMIN', 'STAFF')) return;
     await refreshExpiryAlerts(user.pharmacy_id);
 
-    const standardShelves = [
-      { id: 'Rack A1', rack: 'RACK_A', label: 'A1 - Fast Moving Analgesics', zone: 'Front Left', description: 'Paracetamol, Ibuprofen, Aspirin' },
-      { id: 'Rack A2', rack: 'RACK_A', label: 'A2 - Pain & Anti-inflammatory', zone: 'Front Left', description: 'Diclofenac, Aceclofenac' },
-      { id: 'Rack A3', rack: 'RACK_A', label: 'A3 - Antipyretics & Cold', zone: 'Front Left', description: 'Cetirizine, Cough Syrups' },
-      { id: 'Rack B1', rack: 'RACK_B', label: 'B1 - Broad Spectrum Antibiotics', zone: 'Front Right', description: 'Amoxicillin, Azithromycin' },
-      { id: 'Rack B2', rack: 'RACK_B', label: 'B2 - Cephalosporins & Fluoroquinolones', zone: 'Front Right', description: 'Cefixime, Ciprofloxacin' },
-      { id: 'Rack B3', rack: 'RACK_B', label: 'B3 - Antifungals & Antivirals', zone: 'Front Right', description: 'Fluconazole, Acyclovir' },
-      { id: 'Rack C1', rack: 'RACK_C', label: 'C1 - Cardiovascular & Hypertension', zone: 'Rear Left', description: 'Amlodipine, Telmisartan, Atenolol' },
-      { id: 'Rack C2', rack: 'RACK_C', label: 'C2 - Diabetes & Endocrine', zone: 'Rear Left', description: 'Metformin, Glimepiride' },
-      { id: 'Rack C3', rack: 'RACK_C', label: 'C3 - Gastrointestinal & Antacids', zone: 'Rear Left', description: 'Pantoprazole, Omeprazole, Domperidone' },
-      { id: 'Rack D1', rack: 'RACK_D', label: 'D1 - Dermatological Topicals & Ointments', zone: 'Rear Right', description: 'Betamethasone, Clotrimazole Cream' },
-      { id: 'Rack D2', rack: 'RACK_D', label: 'D2 - Ophthalmic & Otic Drops', zone: 'Rear Right', description: 'Ciprofloxacin Eye Drops, Tears' },
-      { id: 'Rack D3', rack: 'RACK_D', label: 'D3 - Respiratory & Inhalers', zone: 'Rear Right', description: 'Salbutamol, Budesonide Inhalers' },
-      { id: 'Cold Storage F1', rack: 'RACK_COLD', label: 'Cold Bay F1 - Insulins & Biologics (2-8°C)', zone: 'Cold Refrigerator', description: 'Human Insulin, Glargine' },
-      { id: 'Cold Storage F2', rack: 'RACK_COLD', label: 'Cold Bay F2 - Vaccines & Sera (2-8°C)', zone: 'Cold Refrigerator', description: 'Tetanus Toxoid, Rabies Vaccines' }
-    ];
+    const standardShelves = STANDARD_SHELVES;
 
     const rows = await db.prepare(`
       SELECT b.id AS batch_id, b.batch_number, b.quantity, b.selling_price, b.purchase_price,

@@ -358,7 +358,7 @@ async function toggleBatches(id) {
 async function loadBillingView() {
   document.querySelector('#pos-item-error').textContent = '';
   document.querySelector('#pos-checkout-error').textContent = '';
-  
+
   // Load medicine options
   try {
     const response = await api('/api/medicines');
@@ -382,7 +382,7 @@ async function onMedicineChange() {
   const batchSelect = document.querySelector('#pos-batch-select');
   batchSelect.innerHTML = '<option value="">FEFO (Nearest expiry first)</option>';
   currentMedicineBatches = [];
-  
+
   if (!medId) return;
 
   try {
@@ -641,7 +641,7 @@ async function loadAnalyticsView() {
   try {
     const data = await api('/api/analytics/demand');
     forecastData = data;
-    
+
     document.querySelector('#ana-total-meds').textContent = data.summary.totalMedicines || '0';
     document.querySelector('#ana-reliable-count').textContent = data.summary.reliableCount || '0';
     document.querySelector('#ana-insufficient-count').textContent = data.summary.insufficientDataCount || '0';
@@ -794,7 +794,7 @@ async function openQrSticker(batchId) {
   try {
     const res = await api(`/api/batches/${batchId}/qr`);
     currentQrData = res;
-    
+
     document.querySelector('#qr-sticker-med-name').textContent = res.sticker.medicineName;
     document.querySelector('#qr-sticker-gen-name').textContent = `${res.sticker.genericName || 'No generic name'} · ${res.sticker.category || 'Medicine'}`;
     document.querySelector('#qr-sticker-batch-no').textContent = res.sticker.batchNumber;
@@ -804,11 +804,11 @@ async function openQrSticker(batchId) {
     document.querySelector('#qr-sticker-raw-payload').textContent = res.payloadString;
 
     const svgWrapper = document.querySelector('#qr-sticker-svg-wrapper');
-    
+
     // Fetch QR from server endpoint (proven qrcode library)
     try {
       const qrResponse = await fetch(`/api/qr/generate?payload=${encodeURIComponent(res.payloadString)}`);
-      
+
       if (!qrResponse.ok) {
         throw new Error(`QR generation failed: ${qrResponse.status}`);
       }
@@ -1053,7 +1053,7 @@ function selectShelf(shelfId) {
 
   document.querySelector('#inspector-batch-count').textContent = shelf.totalBatches || 0;
   document.querySelector('#inspector-unit-count').textContent = `${shelf.totalUnits || 0} units`;
-  
+
   const alertCount = (shelf.expiredBatches || 0) + (shelf.expiringSoonBatches || 0);
   const alertEl = document.querySelector('#inspector-alert-count');
   alertEl.textContent = `${alertCount} alert${alertCount === 1 ? '' : 's'}`;
@@ -1091,8 +1091,8 @@ function highlightMedicineOnMap(query) {
 
   let firstMatchShelf = null;
   (storeMapData.shelves || []).forEach(shelf => {
-    const hasMatch = (shelf.batches || []).some(b => 
-      b.medicine.name.toLowerCase().includes(query) || 
+    const hasMatch = (shelf.batches || []).some(b =>
+      b.medicine.name.toLowerCase().includes(query) ||
       (b.medicine.genericName && b.medicine.genericName.toLowerCase().includes(query)) ||
       b.batchNumber.toLowerCase().includes(query)
     );
@@ -1144,6 +1144,163 @@ async function locateAndHighlightShelf(locationStr) {
   if (node) {
     node.classList.add('pulsing-highlight');
     setTimeout(() => node.classList.remove('pulsing-highlight'), 3500);
+  }
+}
+
+// ----------------------------------------------------
+// BATCH RELOCATION
+// ----------------------------------------------------
+
+let relocateBatchState = {
+  batchId: null,
+  medicineName: null,
+  batchNumber: null,
+  currentLocation: null,
+  selectedShelfId: null
+};
+
+async function openRelocateBatchDialog(batchId, medicineName, batchNumber, currentLocation) {
+  relocateBatchState = {
+    batchId,
+    medicineName,
+    batchNumber,
+    currentLocation: currentLocation || 'No shelf assigned',
+    selectedShelfId: null
+  };
+
+  document.querySelector('#relocate-medicine-name').textContent = medicineName;
+  document.querySelector('#relocate-batch-number').textContent = batchNumber;
+  document.querySelector('#relocate-current-location').textContent = relocateBatchState.currentLocation;
+  document.querySelector('#relocate-new-location').textContent = 'Click a shelf on the map below';
+  document.querySelector('#relocate-new-location').classList.add('muted');
+  document.querySelector('#relocate-save-btn').disabled = true;
+  document.querySelector('#relocate-error').textContent = '';
+
+  // Render compact map in the dialog
+  await renderRelocateMap();
+
+  openDialog('relocate-batch-dialog');
+}
+
+async function renderRelocateMap() {
+  const container = document.querySelector('#relocate-map-grid');
+  if (!storeMapData || !storeMapData.shelves) {
+    container.innerHTML = '<p class="muted">Loading store layout...</p>';
+    await loadStoreMapView();
+  }
+
+  // Render a compact version of the shelf map
+  const shelves = storeMapData.shelves || [];
+  const racks = {};
+
+  shelves.forEach(shelf => {
+    if (!racks[shelf.rack]) racks[shelf.rack] = [];
+    racks[shelf.rack].push(shelf);
+  });
+
+  let html = '<div class="relocate-racks-grid">';
+
+  for (const [rackName, rackShelves] of Object.entries(racks)) {
+    html += `<div class="relocate-rack-card" data-rack="${rackName}">`;
+    html += `<div class="relocate-rack-name">${rackName.replace('RACK_', 'Rack ').replace('_', ' ')}</div>`;
+    html += '<div class="relocate-shelf-buttons">';
+
+    rackShelves.forEach(shelf => {
+      const isCurrentLocation = shelf.id.toLowerCase() === relocateBatchState.currentLocation.toLowerCase() ||
+                                relocateBatchState.currentLocation.toLowerCase().includes(shelf.id.toLowerCase());
+      html += `<button type="button" class="relocate-shelf-btn ${isCurrentLocation ? 'current-location' : ''}"
+                       data-relocate-shelf="${escapeHtml(shelf.id)}"
+                       title="${escapeHtml(shelf.label || shelf.id)}">
+                 ${escapeHtml(shelf.id)}
+               </button>`;
+    });
+
+    html += '</div></div>';
+  }
+
+  html += '</div>';
+  container.innerHTML = html;
+
+  // Attach click handlers to shelf buttons
+  container.querySelectorAll('[data-relocate-shelf]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const shelfId = btn.dataset.relocateShelf;
+      selectRelocateShelf(shelfId);
+    });
+  });
+}
+
+function selectRelocateShelf(shelfId) {
+  relocateBatchState.selectedShelfId = shelfId;
+
+  // Update UI
+  document.querySelector('#relocate-new-location').textContent = shelfId;
+  document.querySelector('#relocate-new-location').classList.remove('muted');
+  document.querySelector('#relocate-save-btn').disabled = false;
+
+  // Highlight the selected shelf
+  document.querySelectorAll('[data-relocate-shelf]').forEach(btn => {
+    btn.classList.remove('selected');
+  });
+  const selectedBtn = document.querySelector(`[data-relocate-shelf="${shelfId}"]`);
+  if (selectedBtn) selectedBtn.classList.add('selected');
+}
+
+async function saveRelocateBatch() {
+  const errorEl = document.querySelector('#relocate-error');
+  const saveBtn = document.querySelector('#relocate-save-btn');
+
+  if (!relocateBatchState.selectedShelfId) {
+    errorEl.textContent = 'Please select a destination shelf.';
+    return;
+  }
+
+  errorEl.textContent = '';
+  saveBtn.disabled = true;
+  const originalText = saveBtn.textContent;
+  saveBtn.textContent = 'Saving...';
+
+  try {
+    await api(`/api/batches/${relocateBatchState.batchId}/location`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ location: relocateBatchState.selectedShelfId })
+    });
+
+    // Success - close dialog and refresh the batch list
+    closeDialog('relocate-batch-dialog');
+
+    // Find the medicine card and refresh its batches
+    const medicineCards = document.querySelectorAll('.medicine-card');
+    for (const card of medicineCards) {
+      const h3 = card.querySelector('h3');
+      if (h3 && h3.textContent === relocateBatchState.medicineName) {
+        const batchesSection = card.querySelector('.batch-list');
+        if (batchesSection && !batchesSection.hidden) {
+          // Get medicine ID from the batches section ID
+          const medicineId = batchesSection.id.replace('batches-', '');
+          await toggleBatches(medicineId); // Close
+          await toggleBatches(medicineId); // Reopen to refresh
+        }
+        break;
+      }
+    }
+
+    // Show success message
+    const tempSuccess = document.createElement('p');
+    tempSuccess.className = 'hint';
+    tempSuccess.style.color = 'green';
+    tempSuccess.textContent = `✓ Batch ${relocateBatchState.batchNumber} relocated to ${relocateBatchState.selectedShelfId}`;
+    const inventoryView = document.querySelector('#inventory-view');
+    if (inventoryView) {
+      inventoryView.insertBefore(tempSuccess, inventoryView.firstChild);
+      setTimeout(() => tempSuccess.remove(), 4000);
+    }
+
+  } catch (error) {
+    errorEl.textContent = error.message;
+    saveBtn.disabled = false;
+    saveBtn.textContent = originalText;
   }
 }
 
@@ -1256,6 +1413,28 @@ document.querySelector('#add-medicine').addEventListener('click', () => {
 document.querySelector('#medicine-list').addEventListener('click', async event => {
   const qrBatchId = Number(event.target.dataset.qrBatch);
   if (qrBatchId) return openQrSticker(qrBatchId);
+
+  // Handle Map button click for batch relocation
+  const locateShelf = event.target.dataset.locateShelf;
+  if (locateShelf !== undefined) {
+    // Find the batch data from the rendered row
+    const batchRow = event.target.closest('.batch-row');
+    if (!batchRow) return;
+    const batchNumber = batchRow.querySelector('strong').textContent;
+    const medicineCard = event.target.closest('.medicine-card');
+    const medicineName = medicineCard ? medicineCard.querySelector('h3').textContent : 'Unknown';
+
+    // Get batch ID from the QR button sibling (it has data-qr-batch)
+    const qrBtn = batchRow.querySelector('[data-qr-batch]');
+    const batchId = qrBtn ? Number(qrBtn.dataset.qrBatch) : null;
+
+    if (!batchId) {
+      document.querySelector('#inventory-error').textContent = 'Cannot locate batch ID.';
+      return;
+    }
+
+    return openRelocateBatchDialog(batchId, medicineName, batchNumber, locateShelf);
+  }
 
   const id = Number(event.target.dataset.batches || event.target.dataset.addBatch || event.target.dataset.edit || event.target.dataset.delete);
   if (!id) return;
@@ -1467,6 +1646,8 @@ document.querySelector('#alert-list').addEventListener('click', async event => {
 document.querySelectorAll('[data-close]').forEach(button => {
   button.addEventListener('click', () => closeDialog(button.dataset.close));
 });
+
+document.querySelector('#relocate-save-btn').addEventListener('click', saveRelocateBatch);
 
 // ----------------------------------------------------
 // NEAR-EXPIRY REDISTRIBUTION

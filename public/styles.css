@@ -1660,3 +1660,101 @@ dialog form {
   .mreq-tab { flex: 1 1 auto; min-height: 2.5rem; }
   #mreq-detail-dialog { width: 96vw; }
 }
+
+/* ── Batch Relocation Dialog ────────────────────────────────────────────── */
+
+.relocate-batch-content {
+  padding: 1.5rem;
+  max-width: 900px;
+}
+
+.relocate-location-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  margin: 1.5rem 0;
+  padding: 1rem;
+  background: var(--panel-bg);
+  border-radius: 6px;
+}
+
+.relocate-location-value {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-top: 0.25rem;
+}
+
+.relocate-map-hint {
+  margin-bottom: 1rem;
+}
+
+.relocate-map-container {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  background: white;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.relocate-racks-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+}
+
+.relocate-rack-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem;
+  background: var(--panel-bg);
+}
+
+.relocate-rack-name {
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.relocate-shelf-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.relocate-shelf-btn {
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: white;
+  cursor: pointer;
+  font-size: 0.9rem;
+  text-align: left;
+  transition: all 0.2s;
+}
+
+.relocate-shelf-btn:hover {
+  background: var(--primary-light);
+  border-color: var(--primary);
+}
+
+.relocate-shelf-btn.selected {
+  background: var(--primary);
+  color: white;
+  border-color: var(--primary);
+  font-weight: 600;
+}
+
+.relocate-shelf-btn.current-location {
+  background: #fff3cd;
+  border-color: #ffc107;
+  font-weight: 500;
+}
+
+.relocate-shelf-btn.current-location::after {
+  content: " (current)";
+  font-size: 0.75rem;
+  color: #856404;
+}
