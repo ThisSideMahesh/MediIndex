@@ -1184,7 +1184,7 @@ async function openRelocateBatchDialog(batchId, medicineName, batchNumber, curre
 
 async function renderRelocateMap() {
   const container = document.querySelector('#relocate-map-grid');
-  if (!storeMapData || !storeMapData.shelves) {
+  if (!storeMapData || !storeMapData.shelves.length) {
     container.innerHTML = '<p class="muted">Loading store layout...</p>';
     await loadStoreMapView();
   }
