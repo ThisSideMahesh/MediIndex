@@ -1674,7 +1674,7 @@ dialog form {
   gap: 1.5rem;
   margin: 1.5rem 0;
   padding: 1rem;
-  background: var(--panel-bg);
+  background: var(--surface);
   border-radius: 6px;
 }
 
@@ -1689,7 +1689,7 @@ dialog form {
 }
 
 .relocate-map-container {
-  border: 1px solid var(--border);
+  border: 1px solid var(--line);
   border-radius: 8px;
   padding: 1rem;
   background: white;
@@ -1704,10 +1704,10 @@ dialog form {
 }
 
 .relocate-rack-card {
-  border: 1px solid var(--border);
+  border: 1px solid var(--line);
   border-radius: 6px;
   padding: 0.75rem;
-  background: var(--panel-bg);
+  background: var(--surface);
 }
 
 .relocate-rack-name {
@@ -1715,7 +1715,7 @@ dialog form {
   margin-bottom: 0.5rem;
   font-size: 0.85rem;
   text-transform: uppercase;
-  color: var(--text-muted);
+  color: var(--muted);
 }
 
 .relocate-shelf-buttons {
@@ -1726,7 +1726,7 @@ dialog form {
 
 .relocate-shelf-btn {
   padding: 0.5rem;
-  border: 1px solid var(--border);
+  border: 1px solid var(--line);
   border-radius: 4px;
   background: white;
   cursor: pointer;
@@ -1736,14 +1736,14 @@ dialog form {
 }
 
 .relocate-shelf-btn:hover {
-  background: var(--primary-light);
-  border-color: var(--primary);
+  background: var(--accent-light);
+  border-color: var(--accent);
 }
 
 .relocate-shelf-btn.selected {
-  background: var(--primary);
+  background: var(--accent);
   color: white;
-  border-color: var(--primary);
+  border-color: var(--accent);
   font-weight: 600;
 }
 
